@@ -1,0 +1,39 @@
+// proto/raft.proto
+syntax = "proto3";
+package raft;
+option go_package = "raft/proto";
+service Raft {
+  rpc RequestVote(VoteRequest) returns (VoteResponse);
+  rpc AppendEntries(EntriesRequest) returns (EntriesResponse);
+}
+
+message VoteRequest {
+  uint64 term = 1;
+  string candidate_id = 2;
+  uint64 last_log_index = 3;
+  uint64 last_log_term = 4;
+}
+
+message VoteResponse {
+  uint64 term = 1;
+  bool vote_granted = 2;
+}
+
+message EntriesRequest {
+  uint64 term = 1;
+  string leader_id = 2;
+  uint64 prev_log_index = 3;
+  uint64 prev_log_term = 4;
+  repeated LogEntry entries = 5;
+  uint64 leader_commit = 6;
+}
+
+message EntriesResponse {
+  uint64 term = 1;
+  bool success = 2;
+}
+
+message LogEntry {
+  uint64 term = 1;
+  string command = 2; // Example: "PUT:key:value"
+}
