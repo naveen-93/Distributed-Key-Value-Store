@@ -1,27 +1,23 @@
 package main
 
 import (
-	"Distributed-Key-Value-Store/internal/raft"
 	"Distributed-Key-Value-Store/internal/store"
+	pb "Distributed-Key-Value-Store/kvstore/proto"
+	"context"
 	"flag"
+	"fmt"
 	"log"
 	"net"
-	"strings"
-
-	pb "Distributed-Key-Value-Store/kvstore/proto"
-
-	"context"
+	"sync"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 // server: defines a struct that implements the pb.KVStoreServer interface.
 type server struct {
-	pb.UnimplementedKVStoreServer // Embed the unimplemented server.
-	node                          *raft.Node
-	store                         *store.KVStore
+	pb.UnimplementedKVStoreServer
+	mu    sync.RWMutex
+	store *store.KVStore
 }
 
 // mustEmbedUnimplementedKVStoreServer implements proto.KVStoreServer.
@@ -31,57 +27,97 @@ func (s *server) mustEmbedUnimplementedKVStoreServer() {
 
 func main() {
 	var (
-		id    = flag.String("id", "", "Node ID")
-		port  = flag.String("port", "50051", "Port to listen on")
-		peers = flag.String("peers", "", "Comma-separated list of peer addresses")
+		port = flag.String("port", "50051", "Port to listen on")
 	)
 	flag.Parse()
-
-	// Initialize node
-	node := raft.NewNode(*id, strings.Split(*peers, ","))
 
 	// Initialize store
 	kvStore := store.NewKVStore()
 
-	// Start server
-	lis, err := net.Listen("tcp", ":"+*port)
+	// Create server instance
+	s := &server{
+		store: kvStore,
+	}
+
+	// Start gRPC server
+	lis, err := net.Listen("tcp", fmt.Sprintf(":%s", *port))
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)
 	}
 
 	grpcServer := grpc.NewServer()
-	pb.RegisterKVStoreServer(grpcServer, NewServer(node, kvStore))
+	pb.RegisterKVStoreServer(grpcServer, s)
 
+	log.Printf("Starting server on port %s...", *port)
 	if err := grpcServer.Serve(lis); err != nil {
 		log.Fatalf("failed to serve: %v", err)
 	}
 }
 
-func NewServer(node *raft.Node, store *store.KVStore) pb.KVStoreServer {
-
-	server := &server{
-		node:  node,
-		store: store,
-	}
-	return server
-}
-
 func (s *server) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, error) {
-	panic("unimplemented")
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	// Validate key
+	if err := validateKey(req.Key); err != nil {
+		return &pb.GetResponse{
+			Error: err.Error(),
+		}, nil
+	}
+
+	value, exists := s.store.Get(req.Key)
+	return &pb.GetResponse{
+		Value:  value,
+		Exists: exists,
+	}, nil
 }
 
 func (s *server) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
-	panic("unimplemented")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Validate key and value
+	if err := validateKey(req.Key); err != nil {
+		return &pb.PutResponse{
+			Error: err.Error(),
+		}, nil
+	}
+	if err := validateValue(req.Value); err != nil {
+		return &pb.PutResponse{
+			Error: err.Error(),
+		}, nil
+	}
+
+	oldValue, hadOld := s.store.Put(req.Key, req.Value)
+	return &pb.PutResponse{
+		OldValue:    oldValue,
+		HadOldValue: hadOld,
+	}, nil
 }
 
-// AppendEntries is a stub implementation to satisfy pb.KVStoreServer.
-func (s *server) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "AppendEntries is not implemented")
+func validateKey(key string) error {
+	if len(key) == 0 {
+		return fmt.Errorf("key cannot be empty")
+	}
+	if len(key) > 128 {
+		return fmt.Errorf("key too long (max 128 bytes)")
+	}
+	for _, r := range key {
+		if r < 32 || r > 126 || r == '[' || r == ']' {
+			return fmt.Errorf("invalid character in key")
+		}
+	}
+	return nil
 }
 
-// RequestVote is a stub implementation to satisfy the KVStoreServer interface.
-func (s *server) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "RequestVote is not implemented")
+func validateValue(value string) error {
+	if len(value) > 2048 {
+		return fmt.Errorf("value too long (max 2048 bytes)")
+	}
+	for _, r := range value {
+		if r < 32 || r > 126 {
+			return fmt.Errorf("invalid character in value")
+		}
+	}
+	return nil
 }
-
-
