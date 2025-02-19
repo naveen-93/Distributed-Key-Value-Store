@@ -19,10 +19,8 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	KVStore_Get_FullMethodName           = "/kvstore.KVStore/Get"
-	KVStore_Put_FullMethodName           = "/kvstore.KVStore/Put"
-	KVStore_RequestVote_FullMethodName   = "/kvstore.KVStore/RequestVote"
-	KVStore_AppendEntries_FullMethodName = "/kvstore.KVStore/AppendEntries"
+	KVStore_Get_FullMethodName = "/kvstore.KVStore/Get"
+	KVStore_Put_FullMethodName = "/kvstore.KVStore/Put"
 )
 
 // KVStoreClient is the client API for KVStore service.
@@ -31,9 +29,6 @@ const (
 type KVStoreClient interface {
 	Get(ctx context.Context, in *GetRequest, opts ...grpc.CallOption) (*GetResponse, error)
 	Put(ctx context.Context, in *PutRequest, opts ...grpc.CallOption) (*PutResponse, error)
-	// Raft-related RPCs
-	RequestVote(ctx context.Context, in *RequestVoteRequest, opts ...grpc.CallOption) (*RequestVoteResponse, error)
-	AppendEntries(ctx context.Context, in *AppendEntriesRequest, opts ...grpc.CallOption) (*AppendEntriesResponse, error)
 }
 
 type kVStoreClient struct {
@@ -64,35 +59,12 @@ func (c *kVStoreClient) Put(ctx context.Context, in *PutRequest, opts ...grpc.Ca
 	return out, nil
 }
 
-func (c *kVStoreClient) RequestVote(ctx context.Context, in *RequestVoteRequest, opts ...grpc.CallOption) (*RequestVoteResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(RequestVoteResponse)
-	err := c.cc.Invoke(ctx, KVStore_RequestVote_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *kVStoreClient) AppendEntries(ctx context.Context, in *AppendEntriesRequest, opts ...grpc.CallOption) (*AppendEntriesResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(AppendEntriesResponse)
-	err := c.cc.Invoke(ctx, KVStore_AppendEntries_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
 // KVStoreServer is the server API for KVStore service.
 // All implementations must embed UnimplementedKVStoreServer
 // for forward compatibility.
 type KVStoreServer interface {
 	Get(context.Context, *GetRequest) (*GetResponse, error)
 	Put(context.Context, *PutRequest) (*PutResponse, error)
-	// Raft-related RPCs
-	RequestVote(context.Context, *RequestVoteRequest) (*RequestVoteResponse, error)
-	AppendEntries(context.Context, *AppendEntriesRequest) (*AppendEntriesResponse, error)
 	mustEmbedUnimplementedKVStoreServer()
 }
 
@@ -108,12 +80,6 @@ func (UnimplementedKVStoreServer) Get(context.Context, *GetRequest) (*GetRespons
 }
 func (UnimplementedKVStoreServer) Put(context.Context, *PutRequest) (*PutResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Put not implemented")
-}
-func (UnimplementedKVStoreServer) RequestVote(context.Context, *RequestVoteRequest) (*RequestVoteResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method RequestVote not implemented")
-}
-func (UnimplementedKVStoreServer) AppendEntries(context.Context, *AppendEntriesRequest) (*AppendEntriesResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method AppendEntries not implemented")
 }
 func (UnimplementedKVStoreServer) mustEmbedUnimplementedKVStoreServer() {}
 func (UnimplementedKVStoreServer) testEmbeddedByValue()                 {}
@@ -172,42 +138,6 @@ func _KVStore_Put_Handler(srv interface{}, ctx context.Context, dec func(interfa
 	return interceptor(ctx, in, info, handler)
 }
 
-func _KVStore_RequestVote_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(RequestVoteRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(KVStoreServer).RequestVote(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: KVStore_RequestVote_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(KVStoreServer).RequestVote(ctx, req.(*RequestVoteRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _KVStore_AppendEntries_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(AppendEntriesRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(KVStoreServer).AppendEntries(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: KVStore_AppendEntries_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(KVStoreServer).AppendEntries(ctx, req.(*AppendEntriesRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
 // KVStore_ServiceDesc is the grpc.ServiceDesc for KVStore service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -222,14 +152,6 @@ var KVStore_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Put",
 			Handler:    _KVStore_Put_Handler,
-		},
-		{
-			MethodName: "RequestVote",
-			Handler:    _KVStore_RequestVote_Handler,
-		},
-		{
-			MethodName: "AppendEntries",
-			Handler:    _KVStore_AppendEntries_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

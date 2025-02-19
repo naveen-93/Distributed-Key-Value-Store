@@ -4,6 +4,7 @@ import (
 	pb "Distributed-Key-Value-Store/raft/proto"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -167,48 +168,60 @@ func (fs *FileStorage) LoadState() (uint64, string, error) {
 
 // SaveLog persists the Raft log
 func (fs *FileStorage) SaveLog(entries []pb.LogEntry) error {
-	data, err := json.Marshal(entries)
-	if err != nil {
+    // Save as direct array without wrapper
+    data, err := json.Marshal(entries)
+    if err != nil {
+        return err
+    }
+    return atomicWrite(fs.logFile, data)
+}
+
+func atomicWrite(filename string, data []byte) error {
+	tmpFile := filename + ".tmp"
+	if err := os.WriteFile(tmpFile, data, 0644); err != nil {
 		return err
 	}
-	return os.WriteFile(fs.logFile, data, 0644)
+	return os.Rename(tmpFile, filename)
 }
 
 // LoadLog loads the persisted Raft log
 func (fs *FileStorage) LoadLog() ([]pb.LogEntry, error) {
-	data, err := os.ReadFile(fs.logFile)
-	if os.IsNotExist(err) {
-		return []pb.LogEntry{{Term: 0, Command: ""}}, nil // Return dummy entry
-	}
-	if err != nil {
-		return nil, err
-	}
+    data, err := os.ReadFile(fs.logFile)
+    if os.IsNotExist(err) {
+        return []pb.LogEntry{{Term: 0, Command: ""}}, nil
+    }
+    if err != nil {
+        return nil, err
+    }
 
-	var entries []pb.LogEntry
-	if err := json.Unmarshal(data, &entries); err != nil {
-		return nil, err
-	}
-
-	// Ensure dummy entry exists
-	if len(entries) == 0 || entries[0].Term != 0 {
-		entries = append([]pb.LogEntry{{Term: 0, Command: ""}}, entries...)
-	}
-
-	return entries, nil
+    var entries []pb.LogEntry
+    if err := json.Unmarshal(data, &entries); err != nil {
+        return nil, fmt.Errorf("log unmarshal error: %v (data: %s)", err, string(data))
+    }
+    
+    // Ensure dummy entry exists
+    if len(entries) == 0 || entries[0].Term != 0 {
+        entries = append([]pb.LogEntry{{Term: 0, Command: ""}}, entries...)
+    }
+    return entries, nil
 }
-
-// loadPersistedState loads Raft state from stable storage
+// loadPersistedState loads the persisted state
 func (r *Raft) loadPersistedState() error {
 	// Load log first
 	log, err := r.storage.LoadLog()
-	if err != nil {
+	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	r.log = log
 
-	// Ensure dummy entry exists
-	if len(r.log) == 0 || r.log[0].Term != 0 {
-		r.log = append([]pb.LogEntry{{Term: 0, Command: ""}}, r.log...)
+	// Initialize with dummy entry if log is empty or missing
+	if len(log) == 0 {
+		r.log = []pb.LogEntry{{Term: 0, Command: ""}}
+	} else {
+		r.log = log
+		// Ensure first entry is dummy
+		if r.log[0].Term != 0 {
+			r.log = append([]pb.LogEntry{{Term: 0, Command: ""}}, r.log...)
+		}
 	}
 
 	// Load metadata
@@ -216,8 +229,21 @@ func (r *Raft) loadPersistedState() error {
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
+
 	r.currentTerm = term
 	r.votedFor = votedFor
+	r.commitIndex = 0
+	r.lastApplied = 0
+
+	// Find last committed entry from previous session
+	for i := len(r.log) - 1; i > 0; i-- {
+		if r.log[i].Term <= r.currentTerm {
+			r.commitIndex = uint64(i)
+			r.lastApplied = uint64(i)
+			break
+		}
+	}
+
 	return nil
 }
 
@@ -278,9 +304,15 @@ func NewRaft(config Config) (*Raft, error) {
 	}
 
 	// Ensure the log always starts with a dummy entry.
-	if len(r.log) == 0 || (len(r.log) > 0 && (r.log[0].Term != 0 || r.log[0].Command != "")) {
-		r.log = append([]pb.LogEntry{{Term: 0, Command: ""}}, r.log...)
-	}
+	if len(r.log) == 0 || r.log[0].Term != 0 {
+        r.log = []pb.LogEntry{{Term: 0, Command: ""}}
+        if err := r.storage.SaveLog(r.log); err != nil {
+            return nil, err
+        }
+    }
+    
+    // Initialize commit index safely
+    r.commitIndex = min(r.commitIndex, uint64(len(r.log)-1))
 
 	// Start RPC server
 	if err := r.startRPCServer(); err != nil {
@@ -449,46 +481,59 @@ func (r *Raft) AppendEntries(ctx context.Context, req *pb.EntriesRequest) (*pb.E
 }
 
 // Submit adds a new command to the log
+// Add robust submission with leader tracking
 func (r *Raft) Submit(command string) (uint64, error) {
-	r.mu.Lock()
-	if r.state != Leader {
-		r.mu.Unlock()
-		return 0, fmt.Errorf("not leader")
-	}
+    const maxAttempts = 5
+    var lastLeader string
+    
+    for attempt := 0; attempt < maxAttempts; attempt++ {
+        r.mu.RLock()
+        if r.state == Leader {
+            index := uint64(len(r.log))
+            entry := pb.LogEntry{
+                Term:    r.currentTerm,
+                Command: command,
+            }
+            r.log = append(r.log, entry)
+            r.persist()
+            r.mu.RUnlock()
+            return index, nil
+        }
+        
+        // Track last known leader
+        if lastLeader == "" {
+            lastLeader = r.votedFor
+        }
+        r.mu.RUnlock()
 
-	// Append to log
-	index := uint64(len(r.log))
-	entry := pb.LogEntry{
-		Term:    r.currentTerm,
-		Command: command,
-	}
-	r.log = append(r.log, entry)
-	r.persist()
-	r.mu.Unlock()
-
-	// Wait for replication
-	timeout := time.After(time.Second)
-	for {
-		r.mu.RLock()
-		if r.commitIndex >= index {
-			r.mu.RUnlock()
-			return index, nil
-		}
-		if r.state != Leader {
-			r.mu.RUnlock()
-			return 0, fmt.Errorf("no longer leader")
-		}
-		r.mu.RUnlock()
-
-		select {
-		case <-timeout:
-			return 0, fmt.Errorf("timeout waiting for replication")
-		case <-time.After(10 * time.Millisecond):
-			continue
-		}
-	}
+        // Check last known leader
+        if lastLeader != "" {
+            if client, ok := r.peerClients[lastLeader]; ok {
+                ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+                defer cancel()
+                if _, err := client.AppendEntries(ctx, &pb.EntriesRequest{}); err == nil {
+                    continue
+                }
+            }
+        }
+        
+        // Find new leader
+        time.Sleep(time.Duration(attempt) * 100 * time.Millisecond)
+    }
+    return 0, errors.New("max submission attempts exceeded")
 }
-
+func (r *Raft) findCurrentLeader() string {
+    r.mu.RLock()
+    defer r.mu.RUnlock()
+    for id, client := range r.peerClients {
+        ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+        defer cancel()
+        if _, err := client.AppendEntries(ctx, &pb.EntriesRequest{Term: r.currentTerm}); err == nil {
+            return id
+        }
+    }
+    return ""
+}
 // replicateLog replicates log entries to all followers
 func (r *Raft) replicateLog() {
 	r.mu.RLock()
@@ -611,9 +656,15 @@ func (r *Raft) getState() State {
 	defer r.mu.RUnlock()
 	return r.state
 }
-
+const preVoteEnabled = true
 // runCandidate implements the candidate state
 func (r *Raft) runCandidate() {
+	if preVoteEnabled {
+        // Run pre-vote phase first
+        if !r.collectPreVotes() {
+            return
+        }
+    }
 	r.mu.Lock()
 	r.currentTerm++
 	r.votedFor = r.config.ID
@@ -672,10 +723,45 @@ func (r *Raft) runCandidate() {
 		}
 	}
 }
+func (r *Raft) collectPreVotes() bool {
+    r.mu.Lock()
+    currentTerm := r.currentTerm
+    lastLogIndex := r.getLastLogIndex()
+    lastLogTerm := r.getLastLogTerm()
+    r.mu.Unlock()
 
+    votes := 1
+    var wg sync.WaitGroup
+    var mu sync.Mutex
+
+    for peerID := range r.peerClients {
+        wg.Add(1)
+        go func(id string) {
+            defer wg.Done()
+            resp, err := r.peerClients[id].RequestVote(context.Background(), &pb.VoteRequest{
+                Term:         currentTerm + 1,
+                CandidateId:  r.config.ID,
+                LastLogIndex: lastLogIndex,
+                LastLogTerm:  lastLogTerm,
+            })
+            
+            if err == nil && resp.VoteGranted {
+                mu.Lock()
+                votes++
+                mu.Unlock()
+            }
+        }(peerID)
+    }
+
+    wg.Wait()
+    return votes > len(r.peerClients)/2
+}
 // runLeader implements the leader state
 func (r *Raft) runLeader() {
-	// Initialize leader state
+	heartbeatTicker := time.NewTicker(r.config.HeartbeatTimeout)
+    defer heartbeatTicker.Stop()
+
+    
 	r.mu.Lock()
 	for peer := range r.peerClients {
 		r.nextIndex[peer] = uint64(len(r.log))
@@ -686,12 +772,32 @@ func (r *Raft) runLeader() {
 	// Start heartbeat ticker
 	ticker := time.NewTicker(r.config.HeartbeatTimeout / 2)
 	defer ticker.Stop()
+	minInterval := r.config.HeartbeatTimeout / 2
+	maxInterval := r.config.HeartbeatTimeout
+	currentInterval := minInterval
 
 	// Send initial heartbeats
 	r.broadcastAppendEntries()
 
 	for {
 		select {
+		case <-heartbeatTicker.C:
+            if !r.broadcastAppendEntries() {
+                return
+            }
+        case <-r.stopCh:
+            return
+        
+		case <-time.After(currentInterval):
+			if r.broadcastAppendEntries() {
+				currentInterval = minInterval // Reset to fast mode
+			} else {
+				currentInterval = time.Duration(float64(currentInterval) * 1.5)
+				if currentInterval > maxInterval {
+					currentInterval = maxInterval
+				}
+			}
+
 		case <-r.stopCh:
 			return
 		case <-ticker.C:
@@ -704,6 +810,7 @@ func (r *Raft) runLeader() {
 
 // broadcastAppendEntries sends AppendEntries RPCs to all peers
 func (r *Raft) broadcastAppendEntries() bool {
+	log.Printf("Leader %s broadcasting heartbeats", r.config.ID)
 	r.mu.Lock()
 	if r.state != Leader {
 		r.mu.Unlock()
@@ -842,10 +949,13 @@ func (r *Raft) runFollower() {
 
 // stepDown updates term and converts to follower state
 func (r *Raft) stepDown(term uint64) {
-	r.currentTerm = term
-	r.state = Follower
-	r.votedFor = ""
-	r.persist()
+	log.Printf("Node %s stepping down from term %d to %d", r.config.ID, r.currentTerm, term)
+	if term > r.currentTerm {
+		r.currentTerm = term
+		r.state = Follower
+		r.votedFor = ""
+		r.persist()
+	}
 }
 
 // persist saves the current state

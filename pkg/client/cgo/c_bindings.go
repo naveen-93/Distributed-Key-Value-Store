@@ -8,9 +8,9 @@ import (
 	"sync"
 	"unsafe"
 
-	
 	"fmt"
-	
+
+	"Distributed-Key-Value-Store/pkg/client"
 )
 
 var (
@@ -27,7 +27,7 @@ func kv_init(serverList **C.char) C.int {
 	}
 
 	// Create new client
-	client, err := NewClient(servers)
+	client, err := client.NewClient(servers)
 	if err != nil {
 		return -1
 	}
@@ -69,7 +69,7 @@ func kv_get(key *C.char, value *C.char) C.int {
 
 	// Get client (using first client for simplicity)
 	clientsMu.Lock()
-	var client *Client
+	var client *client.Client
 	for _, c := range clients {
 		client = c
 		break
@@ -113,7 +113,7 @@ func kv_put(key *C.char, value *C.char, oldValue *C.char) C.int {
 
 	// Get client
 	clientsMu.Lock()
-	var client *Client
+	var client *client.Client
 	for _, c := range clients {
 		client = c
 		break

@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -280,4 +281,9 @@ func (c *Client) handleLeaderHint(hint string) {
 		}
 		c.mu.Unlock()
 	}
+}
+
+// isUUEncoded returns true if the provided string appears to be UU encoded.
+func isUUEncoded(s string) bool {
+	return strings.HasPrefix(strings.ToLower(s), "begin ")
 }
