@@ -1,14 +1,13 @@
-package client
+package main
 
 // #include <stdlib.h>
 // #include <string.h>
 import "C"
 import (
+	"fmt"
 	"strings"
 	"sync"
 	"unsafe"
-
-	"fmt"
 
 	"Distributed-Key-Value-Store/pkg/client"
 )
@@ -20,19 +19,16 @@ var (
 
 //export kv_init
 func kv_init(serverList **C.char) C.int {
-	// Convert C string array to Go string slice
 	var servers []string
 	for ptr := serverList; *ptr != nil; ptr = (**C.char)(unsafe.Pointer(uintptr(unsafe.Pointer(ptr)) + unsafe.Sizeof(uintptr(0)))) {
 		servers = append(servers, C.GoString(*ptr))
 	}
 
-	// Create new client
 	client, err := client.NewClient(servers)
 	if err != nil {
 		return -1
 	}
 
-	// Store client in global map
 	clientsMu.Lock()
 	clients[unsafe.Pointer(serverList)] = client
 	clientsMu.Unlock()
@@ -57,17 +53,15 @@ func kv_shutdown() C.int {
 
 //export kv_get
 func kv_get(key *C.char, value *C.char) C.int {
-	// Add bounds checking
 	if value == nil {
 		return -1
 	}
 
 	goKey := C.GoString(key)
-	if len(goKey) > 128 {
+	if err := validateKey(goKey); err != nil {
 		return -1
 	}
 
-	// Get client (using first client for simplicity)
 	clientsMu.Lock()
 	var client *client.Client
 	for _, c := range clients {
@@ -80,7 +74,6 @@ func kv_get(key *C.char, value *C.char) C.int {
 		return -1
 	}
 
-	// Perform get operation
 	val, exists, err := client.Get(goKey)
 	if err != nil {
 		return -1
@@ -90,7 +83,6 @@ func kv_get(key *C.char, value *C.char) C.int {
 		return 1
 	}
 
-	// Use safer string copy
 	cValue := C.CString(val)
 	defer C.free(unsafe.Pointer(cValue))
 	C.strncpy(value, cValue, 2048)
@@ -100,7 +92,6 @@ func kv_get(key *C.char, value *C.char) C.int {
 
 //export kv_put
 func kv_put(key *C.char, value *C.char, oldValue *C.char) C.int {
-	// Validate key and value
 	goKey := C.GoString(key)
 	goValue := C.GoString(value)
 
@@ -111,7 +102,6 @@ func kv_put(key *C.char, value *C.char, oldValue *C.char) C.int {
 		return -1
 	}
 
-	// Get client
 	clientsMu.Lock()
 	var client *client.Client
 	for _, c := range clients {
@@ -124,25 +114,27 @@ func kv_put(key *C.char, value *C.char, oldValue *C.char) C.int {
 		return -1
 	}
 
-	// Perform put operation
 	old, hadOld, err := client.Put(goKey, goValue)
 	if err != nil {
 		return -1
 	}
 
-	// Copy old value if it existed
 	if hadOld {
 		if len(old) > 2048 {
 			return -1
 		}
-		C.strncpy(oldValue, C.CString(old), 2048)
+		cOld := C.CString(old)
+		defer C.free(unsafe.Pointer(cOld))
+		C.strncpy(oldValue, cOld, 2048)
 		return 0
 	}
 
 	return 1
 }
 
-// // Helper function to validate keys
+func main() {} // Required for building shared library
+
+// Helper functions remain the same as in your original code
 func validateKey(key string) error {
 	if len(key) > 128 {
 		return fmt.Errorf("key too long (max 128 bytes)")
@@ -156,7 +148,6 @@ func validateKey(key string) error {
 	return nil
 }
 
-// Helper function to validate values
 func validateValue(value string) error {
 	if len(value) > 2048 {
 		return fmt.Errorf("value too long (max 2048 bytes)")
@@ -168,17 +159,12 @@ func validateValue(value string) error {
 		}
 	}
 
-	// Check for UU encoding
 	if isUUEncoded(value) {
 		return fmt.Errorf("UU encoded values not allowed")
 	}
-
 	return nil
 }
 
-// Helper function to check for UU encoding
 func isUUEncoded(s string) bool {
-	// Simple heuristic: UU encoded data typically starts with 'begin'
-	// and contains mostly base64-like characters
 	return strings.HasPrefix(strings.ToLower(s), "begin ")
 }
