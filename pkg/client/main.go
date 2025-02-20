@@ -36,6 +36,17 @@ type Client struct {
 	// Request tracking
 	clientID       uint64
 	requestCounter uint64
+
+	// Add basic metrics
+	metrics struct {
+		getLatency     time.Duration
+		putLatency     time.Duration
+		readRepairs    int64
+		quorumFailures int64
+	}
+
+	// Add circuit breaker for failing nodes
+	nodeStates map[string]nodeState
 }
 
 // NewClient creates a new KVStore client
@@ -50,6 +61,7 @@ func NewClient(servers []string) (*Client, error) {
 		dialTimeout:    5 * time.Second,
 		requestTimeout: 2 * time.Second,
 		maxRetries:     3,
+		nodeStates:     make(map[string]nodeState),
 	}
 
 	// Initialize connections to all servers
@@ -286,4 +298,50 @@ func (c *Client) handleLeaderHint(hint string) {
 // isUUEncoded returns true if the provided string appears to be UU encoded.
 func isUUEncoded(s string) bool {
 	return strings.HasPrefix(strings.ToLower(s), "begin ")
+}
+
+// Add connection health checking
+func (c *Client) checkConnections() {
+	ticker := time.NewTicker(30 * time.Second)
+	go func() {
+		for range ticker.C {
+			c.mu.RLock()
+			for addr, client := range c.connections {
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				// Use a health check RPC if available
+				grpcClient := pb.NewKVStoreClient(client)
+				_, err := grpcClient.Get(ctx, &pb.GetRequest{Key: "__health_check__"})
+				if err != nil {
+					log.Printf("Node %s might be down: %v", addr, err)
+					// Trigger reconnection logic
+				}
+				cancel()
+			}
+			c.mu.RUnlock()
+		}
+	}()
+}
+
+func (c *Client) recordMetrics() {
+	// Implementation
+}
+
+// Add circuit breaker for failing nodes
+type nodeState struct {
+	failures      int
+	lastFailure   time.Time
+	broken        bool
+	failureWindow time.Duration
+}
+
+func (c *Client) checkCircuitBreaker(node string) bool {
+	state, exists := c.nodeStates[node]
+	if !exists {
+		return false
+	}
+
+	if state.broken && time.Since(state.lastFailure) < state.failureWindow {
+		return true
+	}
+	return false
 }
