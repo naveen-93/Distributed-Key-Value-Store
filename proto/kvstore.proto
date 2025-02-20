@@ -3,10 +3,17 @@ package kvstore;
 
 option go_package = "kvstore/proto";
 
+// Client-facing service
 service KVStore {
   rpc Get(GetRequest) returns (GetResponse) {}
   rpc Put(PutRequest) returns (PutResponse) {}
-  
+}
+
+// Node-to-node service
+service NodeInternal {
+  rpc Replicate(ReplicateRequest) returns (ReplicateResponse) {}
+  rpc SyncKeys(SyncRequest) returns (SyncResponse) {}
+  rpc Heartbeat(Ping) returns (Pong) {}
 }
 
 message GetRequest {
@@ -19,7 +26,7 @@ message GetResponse {
   string value = 1;
   bool exists = 2;
   string error = 3;
-  string leader_hint = 4;  // For redirecting clients to the current leader
+  uint64 timestamp = 4;  // For conflict resolution
 }
 
 message PutRequest {
@@ -27,12 +34,48 @@ message PutRequest {
   string value = 2;
   uint64 client_id = 3;
   uint64 request_id = 4;
+  uint64 timestamp = 5;  // For conflict resolution
 }
 
 message PutResponse {
   string old_value = 1;
   bool had_old_value = 2;
   string error = 3;
-  string leader_hint = 4;
+  uint64 old_timestamp = 4;  // Timestamp of the old value
 }
 
+// New messages for node-to-node communication
+message ReplicateRequest {
+  string key = 1;
+  string value = 2;
+  uint64 timestamp = 3;  // (node_id << 32) | logical_clock
+}
+
+message ReplicateResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+message SyncRequest {
+  map<string, uint64> key_timestamps = 1;  // Key -> latest timestamp
+}
+
+message SyncResponse {
+  map<string, KeyValue> missing = 1;  // Keys needing update
+}
+
+message KeyValue {
+  string value = 1;
+  uint64 timestamp = 2;
+}
+
+message Ping {
+  uint32 node_id = 1;
+  uint64 timestamp = 2;
+}
+
+message Pong {
+  uint32 node_id = 1;
+  uint64 timestamp = 2;
+  bool is_leader = 3;
+}

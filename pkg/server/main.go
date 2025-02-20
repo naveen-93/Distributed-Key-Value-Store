@@ -1,123 +1,121 @@
 package main
 
 import (
-	"Distributed-Key-Value-Store/internal/store"
-	pb "Distributed-Key-Value-Store/kvstore/proto"
-	"context"
 	"flag"
 	"fmt"
 	"log"
 	"net"
+	"os"
+	"os/signal"
+	"strings"
 	"sync"
+	"syscall"
 
 	"google.golang.org/grpc"
+
+	"Distributed-Key-Value-Store/internal/node"
+	pb "Distributed-Key-Value-Store/kvstore/proto"
+	"Distributed-Key-Value-Store/pkg/consistenthash"
 )
 
-// server: defines a struct that implements the pb.KVStoreServer interface.
 type server struct {
 	pb.UnimplementedKVStoreServer
-	mu    sync.RWMutex
-	store *store.KVStore
+	pb.UnimplementedNodeInternalServer
+
+	nodeID uint32
+	store  *node.Node
+	ring   *consistenthash.Ring
+	mu     sync.RWMutex
+
+	// Node management
+	peers   map[uint32]string
+	clients map[uint32]pb.NodeInternalClient
 }
 
-// mustEmbedUnimplementedKVStoreServer implements proto.KVStoreServer.
-func (s *server) mustEmbedUnimplementedKVStoreServer() {
-	panic("unimplemented")
-}
-
-func main() {
-	var (
-		port = flag.String("port", "50051", "Port to listen on")
-	)
-	flag.Parse()
-
-	// Initialize store
-	kvStore := store.NewKVStore()
-
-	// Create server instance
+func NewServer(nodeID uint32) *server {
 	s := &server{
-		store: kvStore,
+		nodeID:  nodeID,
+		store:   &node.Node{ID: nodeID},
+		ring:    consistenthash.NewRing(consistenthash.DefaultVirtualNodes),
+		peers:   make(map[uint32]string),
+		clients: make(map[uint32]pb.NodeInternalClient),
 	}
 
-	// Start gRPC server
-	lis, err := net.Listen("tcp", fmt.Sprintf(":%s", *port))
-	if err != nil {
-		log.Fatalf("failed to listen: %v", err)
-	}
-
-	grpcServer := grpc.NewServer()
-	pb.RegisterKVStoreServer(grpcServer, s)
-
-	log.Printf("Starting server on port %s...", *port)
-	if err := grpcServer.Serve(lis); err != nil {
-		log.Fatalf("failed to serve: %v", err)
-	}
+	// Add self to ring
+	s.ring.AddNode(fmt.Sprintf("node-%d", nodeID))
+	return s
 }
 
-func (s *server) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	// Validate key
-	if err := validateKey(req.Key); err != nil {
-		return &pb.GetResponse{
-			Error: err.Error(),
-		}, nil
-	}
-
-	value, exists := s.store.Get(req.Key)
-	return &pb.GetResponse{
-		Value:  value,
-		Exists: exists,
-	}, nil
-}
-
-func (s *server) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
+func (s *server) addPeer(peerID uint32, addr string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Validate key and value
-	if err := validateKey(req.Key); err != nil {
-		return &pb.PutResponse{
-			Error: err.Error(),
-		}, nil
-	}
-	if err := validateValue(req.Value); err != nil {
-		return &pb.PutResponse{
-			Error: err.Error(),
-		}, nil
+	// Add to peer list and ring
+	s.peers[peerID] = addr
+	s.ring.AddNode(fmt.Sprintf("node-%d", peerID))
+
+	// Establish gRPC connection
+	conn, err := grpc.Dial(addr, grpc.WithInsecure())
+	if err != nil {
+		return err
 	}
 
-	oldValue, hadOld := s.store.Put(req.Key, req.Value)
-	return &pb.PutResponse{
-		OldValue:    oldValue,
-		HadOldValue: hadOld,
-	}, nil
-}
-
-func validateKey(key string) error {
-	if len(key) == 0 {
-		return fmt.Errorf("key cannot be empty")
-	}
-	if len(key) > 128 {
-		return fmt.Errorf("key too long (max 128 bytes)")
-	}
-	for _, r := range key {
-		if r < 32 || r > 126 || r == '[' || r == ']' {
-			return fmt.Errorf("invalid character in key")
-		}
-	}
+	s.clients[peerID] = pb.NewNodeInternalClient(conn)
 	return nil
 }
 
-func validateValue(value string) error {
-	if len(value) > 2048 {
-		return fmt.Errorf("value too long (max 2048 bytes)")
+func main() {
+	// Parse flags
+	nodeID := flag.Uint("id", 0, "Node ID (required)")
+	addr := flag.String("addr", ":50051", "Address to listen on")
+	peerList := flag.String("peers", "", "Comma-separated list of peer addresses")
+	flag.Parse()
+
+	if *nodeID == 0 {
+		log.Fatal("Node ID is required")
 	}
-	for _, r := range value {
-		if r < 32 || r > 126 {
-			return fmt.Errorf("invalid character in value")
+
+	// Create server
+	srv := NewServer(uint32(*nodeID))
+
+	// Add peers if provided
+	if *peerList != "" {
+		peers := strings.Split(*peerList, ",")
+		for i, addr := range peers {
+			peerID := uint32(i + 1)
+			if peerID == uint32(*nodeID) {
+				continue
+			}
+			if err := srv.addPeer(peerID, addr); err != nil {
+				log.Printf("Failed to add peer %d at %s: %v", peerID, addr, err)
+			}
 		}
 	}
-	return nil
+
+	// Set up gRPC server
+	lis, err := net.Listen("tcp", *addr)
+	if err != nil {
+		log.Fatalf("Failed to listen on %s: %v", *addr, err)
+	}
+
+	grpcServer := grpc.NewServer()
+	pb.RegisterKVStoreServer(grpcServer, srv)
+	pb.RegisterNodeInternalServer(grpcServer, srv)
+
+	// Start server
+	go func() {
+		log.Printf("Node %d listening on %s", *nodeID, *addr)
+		if err := grpcServer.Serve(lis); err != nil {
+			log.Fatalf("Failed to serve: %v", err)
+		}
+	}()
+
+	// Handle shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	<-sigChan
+	log.Println("Shutting down...")
+	grpcServer.GracefulStop()
+	log.Println("Server stopped")
 }

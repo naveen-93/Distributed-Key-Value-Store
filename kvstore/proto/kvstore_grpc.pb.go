@@ -26,6 +26,8 @@ const (
 // KVStoreClient is the client API for KVStore service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// Client-facing service
 type KVStoreClient interface {
 	Get(ctx context.Context, in *GetRequest, opts ...grpc.CallOption) (*GetResponse, error)
 	Put(ctx context.Context, in *PutRequest, opts ...grpc.CallOption) (*PutResponse, error)
@@ -62,6 +64,8 @@ func (c *kVStoreClient) Put(ctx context.Context, in *PutRequest, opts ...grpc.Ca
 // KVStoreServer is the server API for KVStore service.
 // All implementations must embed UnimplementedKVStoreServer
 // for forward compatibility.
+//
+// Client-facing service
 type KVStoreServer interface {
 	Get(context.Context, *GetRequest) (*GetResponse, error)
 	Put(context.Context, *PutRequest) (*PutResponse, error)
@@ -152,6 +156,188 @@ var KVStore_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Put",
 			Handler:    _KVStore_Put_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "proto/kvstore.proto",
+}
+
+const (
+	NodeInternal_Replicate_FullMethodName = "/kvstore.NodeInternal/Replicate"
+	NodeInternal_SyncKeys_FullMethodName  = "/kvstore.NodeInternal/SyncKeys"
+	NodeInternal_Heartbeat_FullMethodName = "/kvstore.NodeInternal/Heartbeat"
+)
+
+// NodeInternalClient is the client API for NodeInternal service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// Node-to-node service
+type NodeInternalClient interface {
+	Replicate(ctx context.Context, in *ReplicateRequest, opts ...grpc.CallOption) (*ReplicateResponse, error)
+	SyncKeys(ctx context.Context, in *SyncRequest, opts ...grpc.CallOption) (*SyncResponse, error)
+	Heartbeat(ctx context.Context, in *Ping, opts ...grpc.CallOption) (*Pong, error)
+}
+
+type nodeInternalClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewNodeInternalClient(cc grpc.ClientConnInterface) NodeInternalClient {
+	return &nodeInternalClient{cc}
+}
+
+func (c *nodeInternalClient) Replicate(ctx context.Context, in *ReplicateRequest, opts ...grpc.CallOption) (*ReplicateResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReplicateResponse)
+	err := c.cc.Invoke(ctx, NodeInternal_Replicate_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *nodeInternalClient) SyncKeys(ctx context.Context, in *SyncRequest, opts ...grpc.CallOption) (*SyncResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SyncResponse)
+	err := c.cc.Invoke(ctx, NodeInternal_SyncKeys_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *nodeInternalClient) Heartbeat(ctx context.Context, in *Ping, opts ...grpc.CallOption) (*Pong, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Pong)
+	err := c.cc.Invoke(ctx, NodeInternal_Heartbeat_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// NodeInternalServer is the server API for NodeInternal service.
+// All implementations must embed UnimplementedNodeInternalServer
+// for forward compatibility.
+//
+// Node-to-node service
+type NodeInternalServer interface {
+	Replicate(context.Context, *ReplicateRequest) (*ReplicateResponse, error)
+	SyncKeys(context.Context, *SyncRequest) (*SyncResponse, error)
+	Heartbeat(context.Context, *Ping) (*Pong, error)
+	mustEmbedUnimplementedNodeInternalServer()
+}
+
+// UnimplementedNodeInternalServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedNodeInternalServer struct{}
+
+func (UnimplementedNodeInternalServer) Replicate(context.Context, *ReplicateRequest) (*ReplicateResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Replicate not implemented")
+}
+func (UnimplementedNodeInternalServer) SyncKeys(context.Context, *SyncRequest) (*SyncResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method SyncKeys not implemented")
+}
+func (UnimplementedNodeInternalServer) Heartbeat(context.Context, *Ping) (*Pong, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Heartbeat not implemented")
+}
+func (UnimplementedNodeInternalServer) mustEmbedUnimplementedNodeInternalServer() {}
+func (UnimplementedNodeInternalServer) testEmbeddedByValue()                      {}
+
+// UnsafeNodeInternalServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to NodeInternalServer will
+// result in compilation errors.
+type UnsafeNodeInternalServer interface {
+	mustEmbedUnimplementedNodeInternalServer()
+}
+
+func RegisterNodeInternalServer(s grpc.ServiceRegistrar, srv NodeInternalServer) {
+	// If the following call pancis, it indicates UnimplementedNodeInternalServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&NodeInternal_ServiceDesc, srv)
+}
+
+func _NodeInternal_Replicate_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReplicateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NodeInternalServer).Replicate(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NodeInternal_Replicate_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NodeInternalServer).Replicate(ctx, req.(*ReplicateRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _NodeInternal_SyncKeys_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SyncRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NodeInternalServer).SyncKeys(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NodeInternal_SyncKeys_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NodeInternalServer).SyncKeys(ctx, req.(*SyncRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _NodeInternal_Heartbeat_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(Ping)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NodeInternalServer).Heartbeat(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NodeInternal_Heartbeat_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NodeInternalServer).Heartbeat(ctx, req.(*Ping))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// NodeInternal_ServiceDesc is the grpc.ServiceDesc for NodeInternal service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var NodeInternal_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "kvstore.NodeInternal",
+	HandlerType: (*NodeInternalServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "Replicate",
+			Handler:    _NodeInternal_Replicate_Handler,
+		},
+		{
+			MethodName: "SyncKeys",
+			Handler:    _NodeInternal_SyncKeys_Handler,
+		},
+		{
+			MethodName: "Heartbeat",
+			Handler:    _NodeInternal_Heartbeat_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

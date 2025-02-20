@@ -13,52 +13,83 @@ import (
 )
 
 var (
-	clientsMu sync.Mutex
-	clients   = make(map[unsafe.Pointer]*client.Client)
+	globalClient *client.Client
+	globalMu     sync.Mutex
 )
 
 //export kv_init
 func kv_init(serverList **C.char) C.int {
+<<<<<<< Updated upstream:lib/libkv.go
+=======
+	globalMu.Lock()
+	defer globalMu.Unlock()
+
+	// Check if already initialized
+	if globalClient != nil {
+		return C.int(-1)
+	}
+
+	// Convert C string array to Go string slice
+>>>>>>> Stashed changes:pkg/client/cgo/c_bindings.go
 	var servers []string
 	for ptr := serverList; *ptr != nil; ptr = (**C.char)(unsafe.Pointer(uintptr(unsafe.Pointer(ptr)) + unsafe.Sizeof(uintptr(0)))) {
 		servers = append(servers, C.GoString(*ptr))
 	}
 
+<<<<<<< Updated upstream:lib/libkv.go
 	client, err := client.NewClient(servers)
+=======
+	// Create new client
+	var err error
+	globalClient, err = client.NewClient(servers)
+>>>>>>> Stashed changes:pkg/client/cgo/c_bindings.go
 	if err != nil {
-		return -1
+		return C.int(-1)
 	}
 
+<<<<<<< Updated upstream:lib/libkv.go
 	clientsMu.Lock()
 	clients[unsafe.Pointer(serverList)] = client
 	clientsMu.Unlock()
 
 	return 0
+=======
+	return C.int(0)
+>>>>>>> Stashed changes:pkg/client/cgo/c_bindings.go
 }
 
 //export kv_shutdown
 func kv_shutdown() C.int {
-	clientsMu.Lock()
-	defer clientsMu.Unlock()
+	globalMu.Lock()
+	defer globalMu.Unlock()
 
-	for key, client := range clients {
-		if err := client.Close(); err != nil {
-			return -1
-		}
-		delete(clients, key)
+	if globalClient == nil {
+		return C.int(-1)
 	}
 
-	return 0
+	if err := globalClient.Close(); err != nil {
+		return C.int(-1)
+	}
+
+	globalClient = nil
+	return C.int(0)
 }
+
 
 //export kv_get
 func kv_get(key *C.char, value *C.char) C.int {
+<<<<<<< Updated upstream:lib/libkv.go
 	if value == nil {
 		return -1
+=======
+	if globalClient == nil {
+		return C.int(-1)
+>>>>>>> Stashed changes:pkg/client/cgo/c_bindings.go
 	}
 
 	goKey := C.GoString(key)
 	if err := validateKey(goKey); err != nil {
+<<<<<<< Updated upstream:lib/libkv.go
 		return -1
 	}
 
@@ -75,33 +106,59 @@ func kv_get(key *C.char, value *C.char) C.int {
 	}
 
 	val, exists, err := client.Get(goKey)
+=======
+		return C.int(-1)
+	}
+
+	val, exists, err := globalClient.Get(goKey)
+>>>>>>> Stashed changes:pkg/client/cgo/c_bindings.go
 	if err != nil {
-		return -1
+		return C.int(-1)
 	}
 
 	if !exists {
-		return 1
+		return C.int(1)
 	}
 
+<<<<<<< Updated upstream:lib/libkv.go
 	cValue := C.CString(val)
 	defer C.free(unsafe.Pointer(cValue))
 	C.strncpy(value, cValue, 2048)
+=======
+	// Safely copy value to C string buffer
+	if len(val) >= 2048 {
+		return C.int(-1)
+	}
+>>>>>>> Stashed changes:pkg/client/cgo/c_bindings.go
 
-	return 0
+	// Copy with null termination
+	valBytes := []byte(val)
+	dest := (*[2048]byte)(unsafe.Pointer(value))
+	copy(dest[:], valBytes)
+	dest[len(valBytes)] = 0
+
+	return C.int(0)
 }
-
 //export kv_put
 func kv_put(key *C.char, value *C.char, oldValue *C.char) C.int {
+<<<<<<< Updated upstream:lib/libkv.go
+=======
+	if globalClient == nil {
+		return C.int(-1)
+	}
+
+>>>>>>> Stashed changes:pkg/client/cgo/c_bindings.go
 	goKey := C.GoString(key)
 	goValue := C.GoString(value)
 
 	if err := validateKey(goKey); err != nil {
-		return -1
+		return C.int(-1)
 	}
 	if err := validateValue(goValue); err != nil {
-		return -1
+		return C.int(-1)
 	}
 
+<<<<<<< Updated upstream:lib/libkv.go
 	clientsMu.Lock()
 	var client *client.Client
 	for _, c := range clients {
@@ -115,21 +172,33 @@ func kv_put(key *C.char, value *C.char, oldValue *C.char) C.int {
 	}
 
 	old, hadOld, err := client.Put(goKey, goValue)
+=======
+	old, hadOld, err := globalClient.Put(goKey, goValue)
+>>>>>>> Stashed changes:pkg/client/cgo/c_bindings.go
 	if err != nil {
-		return -1
+		return C.int(-1)
 	}
 
 	if hadOld {
-		if len(old) > 2048 {
-			return -1
+		if len(old) >= 2048 {
+			return C.int(-1)
 		}
+<<<<<<< Updated upstream:lib/libkv.go
 		cOld := C.CString(old)
 		defer C.free(unsafe.Pointer(cOld))
 		C.strncpy(oldValue, cOld, 2048)
 		return 0
+=======
+		// Copy old value with null termination
+		oldBytes := []byte(old)
+		dest := (*[2048]byte)(unsafe.Pointer(oldValue))
+		copy(dest[:], oldBytes)
+		dest[len(oldBytes)] = 0
+		return C.int(0)
+>>>>>>> Stashed changes:pkg/client/cgo/c_bindings.go
 	}
 
-	return 1
+	return C.int(1)
 }
 
 func main() {} // Required for building shared library
