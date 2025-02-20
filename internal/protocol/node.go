@@ -31,6 +31,9 @@ type Node struct {
 	// Configuration
 	syncInterval      time.Duration
 	heartbeatInterval time.Duration
+
+	// Added for consistent hashing
+	ring *consistenthash.Ring
 }
 
 func NewNode(id uint32, store *node.Node) *Node {
@@ -42,6 +45,7 @@ func NewNode(id uint32, store *node.Node) *Node {
 		clients:           make(map[uint32]pb.NodeInternalClient),
 		syncInterval:      5 * time.Minute, //
 		heartbeatInterval: time.Second,
+		ring:              consistenthash.NewRing(10),
 	}
 }
 
@@ -189,10 +193,6 @@ func (n *Node) replicateToNodes(key string, value string, timestamp uint64) {
 	n.clientsMu.RLock()
 	defer n.clientsMu.RUnlock()
 
-	// Get replica nodes using consistent hashing
-	hash := consistenthash.HashString(key)
-	replicaCount := 3 // Number of replicas (including primary)
-
 	// Create replication request
 	req := &pb.ReplicateRequest{
 		Key:       key,
@@ -200,31 +200,37 @@ func (n *Node) replicateToNodes(key string, value string, timestamp uint64) {
 		Timestamp: timestamp,
 	}
 
-	// Send only to replica nodes
+	// Get replica nodes using consistent hashing
+	replicaCount := 3 // Number of replicas (including primary)
 	replicasSent := 1 // Count self as first replica
-	current := hash
 
-	for replicasSent < replicaCount && replicasSent < len(n.clients) {
+	// Start from the primary node's hash
+	currentHash := consistenthash.HashString(key)
+
+	// Send to next nodes in the ring
+	for replicasSent < replicaCount {
 		// Get next node in ring
-		nextHash := (current + 1) % uint32(len(n.nodes))
-		nodeID := uint32(nextHash)
-
-		if nodeID != n.ID {
-			if client, exists := n.clients[nodeID]; exists {
-				// Async replication with context timeout
-				go func(c pb.NodeInternalClient) {
-					ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-					defer cancel()
-
-					_, err := c.Replicate(ctx, req)
-					if err != nil {
-						log.Printf("Failed to replicate to node %d: %v", nodeID, err)
-					}
-				}(client)
-				replicasSent++
-			}
+		nextNodeID := n.ring.GetNextNode(currentHash)
+		if nextNodeID == "" || nextNodeID == n.nodes[n.ID] {
+			break // No more nodes available
 		}
-		current = nextHash
+
+		// Convert node address to ID and send if it's not self
+		nodeID := uint32(consistenthash.HashString(nextNodeID))
+		if client, exists := n.clients[nodeID]; exists {
+			go func(c pb.NodeInternalClient) {
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				defer cancel()
+
+				_, err := c.Replicate(ctx, req)
+				if err != nil {
+					log.Printf("Failed to replicate to node %s: %v", nextNodeID, err)
+				}
+			}(client)
+			replicasSent++
+		}
+
+		currentHash = n.ring.GetNodeHash(nextNodeID)
 	}
 }
 
@@ -301,14 +307,77 @@ func (n *Node) GetNodes() map[uint32]string {
 	}
 	return nodes
 }
+
 func (n *Node) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, error) {
-    value, timestamp, exists := n.store.Get(req.Key)
-    if !exists {
-        return &pb.GetResponse{Exists: false}, nil
-    }
-    return &pb.GetResponse{
-        Value:     value,
-        Timestamp: timestamp,
-        Exists:    true,
-    }, nil
+	// Get local value
+	value, timestamp, exists := n.store.Get(req.Key)
+
+	// Get replica nodes for this key
+	currentHash := consistenthash.HashString(req.Key)
+	replicaValues := make([]struct {
+		value     string
+		timestamp uint64
+		nodeID    uint32
+	}, 0)
+
+	// Add local value
+	if exists {
+		replicaValues = append(replicaValues, struct {
+			value     string
+			timestamp uint64
+			nodeID    uint32
+		}{value, timestamp, n.ID})
+	}
+
+	// Query other replicas
+	for i := 0; i < 2; i++ { // Check 2 other replicas
+		nextNodeID := n.ring.GetNextNode(currentHash)
+		if nextNodeID == "" {
+			break
+		}
+
+		nodeID := uint32(consistenthash.HashString(nextNodeID))
+		if client, ok := n.clients[nodeID]; ok {
+			// Use SyncKeys for node-to-node communication
+			resp, err := client.SyncKeys(ctx, &pb.SyncRequest{
+				KeyTimestamps: map[string]uint64{req.Key: 0}, // Request latest value
+			})
+			if err == nil {
+				if kv, exists := resp.Missing[req.Key]; exists {
+					replicaValues = append(replicaValues, struct {
+						value     string
+						timestamp uint64
+						nodeID    uint32
+					}{kv.Value, kv.Timestamp, nodeID})
+				}
+			}
+		}
+		currentHash = n.ring.GetNodeHash(nextNodeID)
+	}
+
+	// Find latest value
+	var latest struct {
+		value     string
+		timestamp uint64
+		exists    bool
+	}
+
+	for _, rv := range replicaValues {
+		if rv.timestamp > latest.timestamp {
+			latest.value = rv.value
+			latest.timestamp = rv.timestamp
+			latest.exists = true
+		}
+	}
+
+	// Perform read repair if needed
+	if latest.exists && latest.timestamp > timestamp {
+		go n.store.Store(req.Key, latest.value, latest.timestamp)
+	}
+
+	return &pb.GetResponse{
+		Value:     latest.value,
+		Exists:    latest.exists,
+		Timestamp: latest.timestamp,
+	}, nil
 }

@@ -2,6 +2,7 @@ package client
 
 import (
 	pb "Distributed-Key-Value-Store/kvstore/proto"
+	"Distributed-Key-Value-Store/pkg/consistenthash"
 	"context"
 	"fmt"
 	"log"
@@ -9,15 +10,15 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"Distributed-Key-Value-Store/pkg/consistenthash"
+
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
 const (
-	defaultReadQuorum   = 2
-	defaultWriteQuorum  = 2
-	numReplicas         = 3
+	defaultReadQuorum  = 2
+	defaultWriteQuorum = 2
+	numReplicas        = 3
 )
 
 // Client represents a KVStore client
@@ -41,7 +42,6 @@ type Client struct {
 	clientID       uint64
 	requestCounter uint64
 }
-
 
 // Value with timestamp for conflict resolution
 type valueWithTimestamp struct {
@@ -81,6 +81,7 @@ func NewClient(servers []string) (*Client, error) {
 
 	return client, nil
 }
+
 // initConnections establishes connections to all servers
 func (c *Client) initConnections() error {
 	for _, server := range c.servers {
@@ -172,13 +173,11 @@ func (c *Client) Put(key, value string) (string, bool, error) {
 		return "", false, fmt.Errorf("no available nodes for key %s", key)
 	}
 
-	timestamp := c.generateTimestamp()
 	req := &pb.PutRequest{
 		Key:       key,
 		Value:     value,
 		ClientId:  c.clientID,
 		RequestId: c.nextRequestID(),
-		Timestamp: timestamp,
 	}
 
 	// Track successful writes and old values
@@ -367,7 +366,6 @@ func (c *Client) performReadRepair(key string, latest valueWithTimestamp, values
 	}
 }
 
-
 func contains(slice []string, str string) bool {
 	for _, s := range slice {
 		if s == str {
@@ -376,16 +374,6 @@ func contains(slice []string, str string) bool {
 	}
 	return false
 }
-
-// // generateTimestamp generates a unique timestamp for requests
-func (c *Client) generateTimestamp() uint64 {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.requestCounter++
-	return c.requestCounter // Server should combine with node ID
-}
-
-
 
 func (c *Client) sendPutToReplica(ctx context.Context, node string, req *pb.PutRequest) (*pb.PutResponse, error) {
 	for retry := 0; retry < c.maxRetries; retry++ {
