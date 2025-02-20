@@ -4,7 +4,7 @@
 #include <pthread.h>
 #include "../libkv.h"
 
-#define NUM_THREADS 100
+#define NUM_THREADS 10
 
 // Structure to pass data to threads
 typedef struct {
