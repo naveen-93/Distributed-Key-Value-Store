@@ -3,6 +3,7 @@ package protocol
 import (
 	"context"
 	"log"
+	"sort"
 	"sync"
 	"time"
 
@@ -17,7 +18,8 @@ type Node struct {
 	ID           uint32
 	store        *node.Node
 	logicalClock uint64
-	mu           sync.RWMutex
+
+	storeMu sync.RWMutex
 
 	// Node management
 	nodes      map[uint32]string // nodeID -> address
@@ -34,6 +36,9 @@ type Node struct {
 
 	// Added for consistent hashing
 	ring *consistenthash.Ring
+
+	// Ring state
+	ringVersion uint64
 }
 
 func NewNode(id uint32, store *node.Node) *Node {
@@ -46,6 +51,7 @@ func NewNode(id uint32, store *node.Node) *Node {
 		syncInterval:      5 * time.Minute, //
 		heartbeatInterval: time.Second,
 		ring:              consistenthash.NewRing(10),
+		ringVersion:       0,
 	}
 }
 
@@ -65,22 +71,38 @@ func (n *Node) Replicate(ctx context.Context, req *pb.ReplicateRequest) (*pb.Rep
 // SyncKeys handles anti-entropy sync requests
 func (n *Node) SyncKeys(ctx context.Context, req *pb.SyncRequest) (*pb.SyncResponse, error) {
 	missing := make(map[string]*pb.KeyValue)
+	deletions := make(map[string]uint64)
 
-	for key, remoteTs := range req.KeyTimestamps {
-		localValue, localTs, exists := n.store.Get(key)
-		if !exists {
-			continue
-		}
+	// Process key ranges in batches
+	for start, end := range req.KeyRanges {
+		n.storeMu.RLock()
+		keys := n.store.GetKeys()
+		for _, key := range keys {
+			if key < start || key >= end {
+				continue
+			}
 
-		if localTs > remoteTs {
-			missing[key] = &pb.KeyValue{
-				Value:     localValue,
-				Timestamp: localTs,
+			value, timestamp, exists := n.store.Get(key)
+			remoteTs := req.KeyTimestamps[key]
+
+			if !exists {
+				// Track deletions
+				deletions[key] = timestamp
+			} else if timestamp > remoteTs {
+				missing[key] = &pb.KeyValue{
+					Value:     value,
+					Timestamp: timestamp,
+					Deleted:   !exists,
+				}
 			}
 		}
+		n.storeMu.RUnlock()
 	}
 
-	return &pb.SyncResponse{Missing: missing}, nil
+	return &pb.SyncResponse{
+		Missing:   missing,
+		Deletions: deletions,
+	}, nil
 }
 
 // StartAntiEntropy begins periodic anti-entropy sync
@@ -99,15 +121,8 @@ func (n *Node) StartAntiEntropy() {
 }
 
 func (n *Node) performAntiEntropy() {
-
-	// Get local key timestamps
-	keyTimestamps := make(map[string]uint64)
-	for _, key := range n.store.GetKeys() {
-		_, timestamp, exists := n.store.Get(key)
-		if exists {
-			keyTimestamps[key] = timestamp
-		}
-	}
+	// Get local key ranges (e.g., divide keyspace into chunks)
+	keyRanges := n.getKeyRanges()
 
 	// Send to each node
 	for nodeID, client := range n.getClients() {
@@ -115,28 +130,75 @@ func (n *Node) performAntiEntropy() {
 			continue
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
-		resp, err := client.SyncKeys(ctx, &pb.SyncRequest{
-			KeyTimestamps: keyTimestamps,
-		})
-		cancel()
+		// Sync each range separately
+		for start, end := range keyRanges {
+			keyTimestamps := make(map[string]uint64)
 
-		if err != nil {
-			log.Printf("Anti-entropy with node %d failed: %v", nodeID, err)
-			continue
-		}
+			// Get timestamps for keys in range
+			n.storeMu.RLock()
+			for _, key := range n.store.GetKeys() {
+				if key >= start && key < end {
+					_, timestamp, exists := n.store.Get(key)
+					if exists {
+						keyTimestamps[key] = timestamp
+					}
+				}
+			}
+			n.storeMu.RUnlock()
 
-		// Apply missing updates
-		for key, kv := range resp.Missing {
-			n.store.Store(key, kv.Value, kv.Timestamp)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+			resp, err := client.SyncKeys(ctx, &pb.SyncRequest{
+				KeyTimestamps: keyTimestamps,
+				KeyRanges:     map[string]string{start: end},
+			})
+			cancel()
+
+			if err != nil {
+				log.Printf("Anti-entropy with node %d failed: %v", nodeID, err)
+				continue
+			}
+
+			// Apply missing updates and deletions
+			n.storeMu.Lock()
+			for key, kv := range resp.Missing {
+				n.store.Store(key, kv.Value, kv.Timestamp)
+			}
+			for key, ts := range resp.Deletions {
+				if _, existing, exists := n.store.Get(key); !exists || ts > existing {
+					n.store.Store(key, "", ts)
+				}
+			}
+			n.storeMu.Unlock()
 		}
 	}
 }
 
+func (n *Node) getKeyRanges() map[string]string {
+	ranges := make(map[string]string)
+	rangeSize := 1000 // Adjust based on your needs
+
+	n.storeMu.RLock()
+	keys := n.store.GetKeys()
+	n.storeMu.RUnlock()
+	n.storeMu.RUnlock()
+
+	sort.Strings(keys)
+
+	for i := 0; i < len(keys); i += rangeSize {
+		end := i + rangeSize
+		if end > len(keys) {
+			end = len(keys)
+		}
+		ranges[keys[i]] = keys[end-1] + "\x00"
+	}
+
+	return ranges
+}
+
 // getTimestamp generates a new timestamp for writes
 func (n *Node) getTimestamp(key string) uint64 {
-	n.mu.Lock()
-	defer n.mu.Unlock()
+	n.storeMu.Lock()
+	defer n.storeMu.Unlock()
 	n.logicalClock++
 	return (uint64(n.ID) << 32) | n.logicalClock
 }
@@ -149,8 +211,8 @@ func (n *Node) getLocalTimestamp(key string) uint64 {
 
 // updateTimestamp updates logical clock based on received timestamp
 func (n *Node) updateTimestamp(receivedTS uint64) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
+	n.storeMu.Lock()
+	defer n.storeMu.Unlock()
 	receivedClock := receivedTS & 0xFFFFFFFF
 	if receivedClock > n.logicalClock {
 		n.logicalClock = receivedClock
@@ -173,6 +235,8 @@ func (n *Node) StartHeartbeat() {
 	go func() {
 		ticker := time.NewTicker(n.heartbeatInterval)
 		for range ticker.C {
+			anyStateChanged := false
+			n.statusMu.Lock()
 			for nodeID, _ := range n.nodes {
 				if nodeID == n.ID {
 					continue
@@ -180,9 +244,21 @@ func (n *Node) StartHeartbeat() {
 				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 				_, err := n.clients[nodeID].Heartbeat(ctx, &pb.Ping{NodeId: n.ID})
 				cancel()
-				n.statusMu.Lock()
-				n.nodeStatus[nodeID] = (err == nil)
-				n.statusMu.Unlock()
+
+				// Update node status and track changes
+				newStatus := (err == nil)
+				if n.nodeStatus[nodeID] != newStatus {
+					n.nodeStatus[nodeID] = newStatus
+					anyStateChanged = true
+				}
+			}
+			n.statusMu.Unlock()
+
+			// Update ring version if any node status changed
+			if anyStateChanged {
+				n.storeMu.Lock()
+				n.ringVersion++
+				n.storeMu.Unlock()
 			}
 		}
 	}()
@@ -259,8 +335,8 @@ func (n *Node) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, er
 
 // Node management methods
 func (n *Node) AddNode(nodeID uint32, addr string) error {
-	n.mu.Lock()
-	defer n.mu.Unlock()
+	n.storeMu.Lock()
+	defer n.storeMu.Unlock()
 
 	// Add to node list
 	n.nodes[nodeID] = addr
@@ -282,8 +358,8 @@ func (n *Node) AddNode(nodeID uint32, addr string) error {
 }
 
 func (n *Node) RemoveNode(nodeID uint32) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
+	n.storeMu.Lock()
+	defer n.storeMu.Unlock()
 
 	// Clean up client connection
 	n.clientsMu.Lock()
@@ -298,8 +374,8 @@ func (n *Node) RemoveNode(nodeID uint32) {
 }
 
 func (n *Node) GetNodes() map[uint32]string {
-	n.mu.RLock()
-	defer n.mu.RUnlock()
+	n.storeMu.RLock()
+	defer n.storeMu.RUnlock()
 
 	nodes := make(map[uint32]string)
 	for id, addr := range n.nodes {
@@ -380,4 +456,28 @@ func (n *Node) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, er
 		Exists:    latest.exists,
 		Timestamp: latest.timestamp,
 	}, nil
+}
+
+// RingState represents the current state of the consistent hash ring
+type RingState struct {
+	Version   uint64          // Incremented on changes
+	Nodes     map[string]bool // node address -> isActive
+	UpdatedAt int64           // Unix timestamp
+}
+
+func (n *Node) GetRingState(ctx context.Context, req *pb.RingStateRequest) (*pb.RingStateResponse, error) {
+	n.storeMu.RLock()
+	state := &pb.RingStateResponse{
+		Version:   n.ringVersion,
+		Nodes:     make(map[string]bool),
+		UpdatedAt: time.Now().Unix(),
+	}
+
+	// Copy current node states
+	for addr, status := range n.nodeStatus {
+		state.Nodes[n.nodes[addr]] = status
+	}
+	n.storeMu.RUnlock()
+
+	return state, nil
 }

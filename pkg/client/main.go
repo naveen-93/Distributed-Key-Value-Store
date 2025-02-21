@@ -28,6 +28,7 @@ type Client struct {
 	// Server management
 	servers     []string
 	ring        *consistenthash.Ring
+	ringVersion uint64
 	connections map[string]*grpc.ClientConn
 	clients     map[string]pb.KVStoreClient
 
@@ -38,9 +39,17 @@ type Client struct {
 	readQuorum     int
 	writeQuorum    int
 
+	// Ring update configuration
+	ringUpdateInterval time.Duration
+	lastRingUpdate     time.Time
+
 	// Request tracking
 	clientID       uint64
 	requestCounter uint64
+
+	nodeStates  map[string]*nodeState
+	nodeStateMu sync.RWMutex
+	maxFailures int
 }
 
 // Value with timestamp for conflict resolution
@@ -51,6 +60,11 @@ type valueWithTimestamp struct {
 	nodeAddr  string
 }
 
+type nodeState struct {
+	lastSuccess time.Time
+	failures    int
+}
+
 // NewClient creates a new KVStore client
 func NewClient(servers []string) (*Client, error) {
 	if len(servers) == 0 {
@@ -58,26 +72,31 @@ func NewClient(servers []string) (*Client, error) {
 	}
 
 	client := &Client{
-		servers:        servers,
-		connections:    make(map[string]*grpc.ClientConn),
-		clients:        make(map[string]pb.KVStoreClient),
-		dialTimeout:    5 * time.Second,
-		requestTimeout: 2 * time.Second,
-		maxRetries:     3,
-		readQuorum:     defaultReadQuorum,
-		writeQuorum:    defaultWriteQuorum,
-	}
-
-	// Initialize consistent hashing ring
-	client.ring = consistenthash.NewRing(consistenthash.DefaultVirtualNodes)
-	for _, server := range servers {
-		client.ring.AddNode(server)
+		servers:            servers,
+		connections:        make(map[string]*grpc.ClientConn),
+		clients:            make(map[string]pb.KVStoreClient),
+		dialTimeout:        5 * time.Second,
+		requestTimeout:     2 * time.Second,
+		maxRetries:         3,
+		readQuorum:         defaultReadQuorum,
+		writeQuorum:        defaultWriteQuorum,
+		ringUpdateInterval: 30 * time.Second,
+		nodeStates:         make(map[string]*nodeState),
+		maxFailures:        3,
 	}
 
 	// Initialize connections to all servers
 	if err := client.initConnections(); err != nil {
 		return nil, fmt.Errorf("failed to initialize connections: %v", err)
 	}
+
+	// Get initial ring state
+	if err := client.updateRing(); err != nil {
+		return nil, fmt.Errorf("failed to get initial ring state: %v", err)
+	}
+
+	// Start periodic ring updates
+	client.startRingUpdates()
 
 	return client, nil
 }
@@ -343,9 +362,11 @@ func (c *Client) resolveConflicts(values []valueWithTimestamp) valueWithTimestam
 }
 
 func (c *Client) performReadRepair(key string, latest valueWithTimestamp, values []valueWithTimestamp) {
-	for _, val := range values {
-		if val.timestamp < latest.timestamp {
-			// Update stale replica
+	
+		// Existing value repair
+		for _, val := range values {
+			if val.timestamp < latest.timestamp {
+				// Update stale replica
 			req := &pb.PutRequest{
 				Key:       key,
 				Value:     latest.value,
@@ -385,4 +406,78 @@ func (c *Client) sendPutToReplica(ctx context.Context, node string, req *pb.PutR
 		time.Sleep(time.Duration(retry+1) * 50 * time.Millisecond)
 	}
 	return nil, fmt.Errorf("failed after %d retries", c.maxRetries)
+}
+
+func (c *Client) recordNodeSuccess(addr string) {
+	c.nodeStateMu.Lock()
+	defer c.nodeStateMu.Unlock()
+
+	if state, exists := c.nodeStates[addr]; exists {
+		state.lastSuccess = time.Now()
+		state.failures = 0
+	}
+}
+
+func (c *Client) recordNodeFailure(addr string) bool {
+	c.nodeStateMu.Lock()
+	defer c.nodeStateMu.Unlock()
+
+	state := c.nodeStates[addr]
+	if state == nil {
+		state = &nodeState{}
+		c.nodeStates[addr] = state
+	}
+
+	state.failures++
+	return state.failures >= c.maxFailures
+}
+
+func (c *Client) updateRing() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for _, server := range c.servers {
+		if client, ok := c.clients[server]; ok {
+			ctx, cancel := context.WithTimeout(context.Background(), c.dialTimeout)
+			resp, err := client.GetRingState(ctx, &pb.RingStateRequest{})
+			cancel()
+
+			if err != nil {
+				if c.recordNodeFailure(server) {
+					log.Printf("Node %s marked as dead after %d failures", server, c.maxFailures)
+				}
+				continue
+			}
+
+			c.recordNodeSuccess(server)
+
+			// Only update if version is newer
+			if resp.Version > c.ringVersion {
+				newRing := consistenthash.NewRing(consistenthash.DefaultVirtualNodes)
+				for node, isActive := range resp.Nodes {
+					if isActive {
+						newRing.AddNode(node)
+					}
+				}
+				c.ring = newRing
+				c.ringVersion = resp.Version
+				c.lastRingUpdate = time.Unix(resp.UpdatedAt, 0)
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("failed to update ring state from any server")
+}
+
+func (c *Client) startRingUpdates() {
+	go func() {
+		ticker := time.NewTicker(c.ringUpdateInterval)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			if err := c.updateRing(); err != nil {
+				log.Printf("Ring update failed: %v", err)
+			}
+		}
+	}()
 }

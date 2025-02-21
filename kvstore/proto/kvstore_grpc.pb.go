@@ -19,8 +19,9 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	KVStore_Get_FullMethodName = "/kvstore.KVStore/Get"
-	KVStore_Put_FullMethodName = "/kvstore.KVStore/Put"
+	KVStore_Get_FullMethodName          = "/kvstore.KVStore/Get"
+	KVStore_Put_FullMethodName          = "/kvstore.KVStore/Put"
+	KVStore_GetRingState_FullMethodName = "/kvstore.KVStore/GetRingState"
 )
 
 // KVStoreClient is the client API for KVStore service.
@@ -31,6 +32,7 @@ const (
 type KVStoreClient interface {
 	Get(ctx context.Context, in *GetRequest, opts ...grpc.CallOption) (*GetResponse, error)
 	Put(ctx context.Context, in *PutRequest, opts ...grpc.CallOption) (*PutResponse, error)
+	GetRingState(ctx context.Context, in *RingStateRequest, opts ...grpc.CallOption) (*RingStateResponse, error)
 }
 
 type kVStoreClient struct {
@@ -61,6 +63,16 @@ func (c *kVStoreClient) Put(ctx context.Context, in *PutRequest, opts ...grpc.Ca
 	return out, nil
 }
 
+func (c *kVStoreClient) GetRingState(ctx context.Context, in *RingStateRequest, opts ...grpc.CallOption) (*RingStateResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RingStateResponse)
+	err := c.cc.Invoke(ctx, KVStore_GetRingState_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // KVStoreServer is the server API for KVStore service.
 // All implementations must embed UnimplementedKVStoreServer
 // for forward compatibility.
@@ -69,6 +81,7 @@ func (c *kVStoreClient) Put(ctx context.Context, in *PutRequest, opts ...grpc.Ca
 type KVStoreServer interface {
 	Get(context.Context, *GetRequest) (*GetResponse, error)
 	Put(context.Context, *PutRequest) (*PutResponse, error)
+	GetRingState(context.Context, *RingStateRequest) (*RingStateResponse, error)
 	mustEmbedUnimplementedKVStoreServer()
 }
 
@@ -84,6 +97,9 @@ func (UnimplementedKVStoreServer) Get(context.Context, *GetRequest) (*GetRespons
 }
 func (UnimplementedKVStoreServer) Put(context.Context, *PutRequest) (*PutResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Put not implemented")
+}
+func (UnimplementedKVStoreServer) GetRingState(context.Context, *RingStateRequest) (*RingStateResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetRingState not implemented")
 }
 func (UnimplementedKVStoreServer) mustEmbedUnimplementedKVStoreServer() {}
 func (UnimplementedKVStoreServer) testEmbeddedByValue()                 {}
@@ -142,6 +158,24 @@ func _KVStore_Put_Handler(srv interface{}, ctx context.Context, dec func(interfa
 	return interceptor(ctx, in, info, handler)
 }
 
+func _KVStore_GetRingState_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RingStateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(KVStoreServer).GetRingState(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: KVStore_GetRingState_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(KVStoreServer).GetRingState(ctx, req.(*RingStateRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // KVStore_ServiceDesc is the grpc.ServiceDesc for KVStore service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -156,6 +190,10 @@ var KVStore_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Put",
 			Handler:    _KVStore_Put_Handler,
+		},
+		{
+			MethodName: "GetRingState",
+			Handler:    _KVStore_GetRingState_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

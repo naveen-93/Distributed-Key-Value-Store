@@ -7,6 +7,7 @@ option go_package = "kvstore/proto";
 service KVStore {
   rpc Get(GetRequest) returns (GetResponse) {}
   rpc Put(PutRequest) returns (PutResponse) {}
+  rpc GetRingState(RingStateRequest) returns (RingStateResponse) {}
 }
 
 // Node-to-node service
@@ -14,6 +15,7 @@ service NodeInternal {
   rpc Replicate(ReplicateRequest) returns (ReplicateResponse) {}
   rpc SyncKeys(SyncRequest) returns (SyncResponse) {}
   rpc Heartbeat(Ping) returns (Pong) {}
+  rpc GarbageCollect(GarbageCollectRequest) returns (GarbageCollectResponse) {}
 }
 
 message GetRequest {
@@ -57,16 +59,20 @@ message ReplicateResponse {
 }
 
 message SyncRequest {
-  map<string, uint64> key_timestamps = 1;  // Key -> latest timestamp
+  map<string, uint64> key_timestamps = 1;
+  map<string, uint64> tombstone_timestamps = 2;  // Track deletions
 }
 
 message SyncResponse {
-  map<string, KeyValue> missing = 1;  // Keys needing update
+  map<string, KeyValue> missing = 1;
+  map<string, uint64> stale_tombstones = 2;  // For cleanup
 }
 
 message KeyValue {
   string value = 1;
   uint64 timestamp = 2;
+  bool is_tombstone = 3;  // New field
+  uint64 ttl = 4;         // Tombstone time-to-live (seconds)
 }
 
 message Ping {
@@ -78,4 +84,12 @@ message Pong {
   uint32 node_id = 1;
   uint64 timestamp = 2;
   bool is_leader = 3;
+}
+
+message RingStateRequest {}
+
+message RingStateResponse {
+  uint64 version = 1;
+  map<string, bool> nodes = 2;
+  int64 updated_at = 3;
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"google.golang.org/grpc"
 
@@ -61,7 +63,46 @@ func (s *server) addPeer(peerID uint32, addr string) error {
 	}
 
 	s.clients[peerID] = pb.NewNodeInternalClient(conn)
+
+	// Trigger ring rebalancing
+	s.rebalanceRing()
+
 	return nil
+}
+
+func (s *server) rebalanceRing() {
+	s.mu.RLock()
+	keys := s.store.GetKeys() // Assuming GetKeys() returns all keys in the store
+	s.mu.RUnlock()
+
+	for _, key := range keys {
+		// Calculate the new node for the key based on the updated ring
+		hash := consistenthash.HashString(key)
+		newNodeID := s.ring.GetNode(fmt.Sprintf("%d", hash))
+
+		// If the new node is different from the current node, move the key
+		if newNodeID != fmt.Sprintf("node-%d", s.nodeID) {
+			value, timestamp, exists := s.store.Get(key)
+			if exists {
+				// Replicate the key to the new node
+				req := &pb.ReplicateRequest{
+					Key:       key,
+					Value:     value,
+					Timestamp: timestamp,
+				}
+
+				if client, ok := s.clients[uint32(consistenthash.HashString(newNodeID))]; ok {
+					ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+					defer cancel()
+
+					_, err := client.Replicate(ctx, req)
+					if err != nil {
+						log.Printf("Failed to replicate key %s to node %s: %v", key, newNodeID, err)
+					}
+				}
+			}
+		}
+	}
 }
 
 func main() {
