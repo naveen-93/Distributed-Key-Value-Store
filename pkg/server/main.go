@@ -77,7 +77,7 @@ func (s *server) rebalanceRing() {
 
 	for _, key := range keys {
 		// Calculate the new node for the key based on the updated ring
-		hash := consistenthash.HashString(key)
+		hash := s.ring.HashKey(key)
 		newNodeID := s.ring.GetNode(fmt.Sprintf("%d", hash))
 
 		// If the new node is different from the current node, move the key
@@ -87,11 +87,11 @@ func (s *server) rebalanceRing() {
 				// Replicate the key to the new node
 				req := &pb.ReplicateRequest{
 					Key:       key,
-					Value:     value,
-					Timestamp: timestamp,
+					Value:     string(value),
+					Timestamp: uint64(timestamp),
 				}
 
-				if client, ok := s.clients[uint32(consistenthash.HashString(newNodeID))]; ok {
+				if client, ok := s.clients[uint32(s.ring.HashKey(newNodeID))]; ok {
 					ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 					defer cancel()
 

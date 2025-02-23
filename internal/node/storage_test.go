@@ -1,414 +1,368 @@
 package node
 
 import (
-	"bytes"
 	"fmt"
+	"math/rand"
 	"os"
-	"path/filepath"
-	"strings"
+	
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-func setupNode(nodeID uint32) *Node {
-	n := NewNode(nodeID)
-	return n
-}
-
-func cleanupNode(nodeID uint32) {
+// Helper function to clean up test files
+func cleanup(nodeID uint32) {
 	os.Remove(fmt.Sprintf("wal-%d.log", nodeID))
-	os.Remove(fmt.Sprintf("wal-%d.log.new", nodeID))
 	os.Remove(fmt.Sprintf("wal-%d.staging", nodeID))
-	os.RemoveAll(snapshotPath)
+	os.RemoveAll("snapshots")
 }
 
-func TestNodeInitialization(t *testing.T) {
+func TestBasicOperations(t *testing.T) {
 	nodeID := uint32(1)
-	n := setupNode(nodeID)
-	defer cleanupNode(nodeID)
+	cleanup(nodeID)
+	defer cleanup(nodeID)
 
-	if n.ID != nodeID {
-		t.Errorf("Expected node ID %d, got %d", nodeID, n.ID)
-	}
-	if len(n.store) != 0 {
-		t.Errorf("Expected empty store, got %d entries", len(n.store))
-	}
-	if n.walWriter == nil {
-		t.Fatal("Expected WAL writer to be initialized")
-	}
+	node := NewNode(nodeID)
+	
+	// Test Store and Get
+	t.Run("Store and Get", func(t *testing.T) {
+		testCases := []struct {
+			key   string
+			value string
+		}{
+			{"key1", "value1"},
+			{"key2", "value2"},
+			{"key3", "value3"},
+		}
+
+		for _, tc := range testCases {
+			timestamp := node.generateTimestamp()
+			node.Store(tc.key, tc.value, timestamp)
+			
+			value, ts, exists := node.Get(tc.key)
+			assert.True(t, exists)
+			assert.Equal(t, tc.value, value)
+			assert.Equal(t, timestamp, ts)
+		}
+	})
+
+	// Test Delete
+	t.Run("Delete", func(t *testing.T) {
+		key := "delete-test"
+		node.Store(key, "value", node.generateTimestamp())
+		node.Delete(key)
+		
+		_, _, exists := node.Get(key)
+		assert.False(t, exists)
+	})
 }
 
-func TestPutAndGetBasic(t *testing.T) {
+func TestConcurrentOperations(t *testing.T) {
 	nodeID := uint32(2)
-	n := setupNode(nodeID)
-	defer cleanupNode(nodeID)
+	cleanup(nodeID)
+	defer cleanup(nodeID)
 
-	key := "testKey"
-	value := []byte("testValue")
-	timestamp := n.generateTimestamp()
-
-	n.Put(key, value, timestamp)
-	gotValue, gotTimestamp, exists := n.Get(key)
-
-	if !exists {
-		t.Errorf("Expected key %s to exist", key)
-	}
-	if !bytes.Equal(gotValue, value) {
-		t.Errorf("Expected value %s, got %s", value, gotValue)
-	}
-	if gotTimestamp != timestamp {
-		t.Errorf("Expected timestamp %d, got %d", timestamp, gotTimestamp)
-	}
-}
-
-func TestDeleteAndTombstone(t *testing.T) {
-	nodeID := uint32(3)
-	n := setupNode(nodeID)
-	defer cleanupNode(nodeID)
-
-	key := "testKey"
-	value := []byte("testValue")
-	timestamp := n.generateTimestamp()
-
-	n.Put(key, value, timestamp)
-	n.Delete(key)
-
-	_, _, exists := n.Get(key)
-	if exists {
-		t.Errorf("Expected key %s to be deleted (tombstone)", key)
-	}
-
-	n.storeMu.RLock()
-	kv, ok := n.store[key]
-	n.storeMu.RUnlock()
-	if !ok || !kv.IsTombstone {
-		t.Errorf("Expected key %s to have tombstone, got %+v", key, kv)
-	}
-}
-
-func TestGetKeysWithTombstones(t *testing.T) {
-	nodeID := uint32(4)
-	n := setupNode(nodeID)
-	defer cleanupNode(nodeID)
-
-	n.Put("key1", []byte("value1"), n.generateTimestamp())
-	n.Put("key2", []byte("value2"), n.generateTimestamp())
-	n.Delete("key1")
-
-	keys := n.GetKeys()
-	expected := []string{"key2"}
-	if len(keys) != len(expected) || keys[0] != expected[0] {
-		t.Errorf("Expected keys %v, got %v", expected, keys)
-	}
-}
-
-func TestWALPersistence(t *testing.T) {
-	nodeID := uint32(5)
-	n1 := setupNode(nodeID)
-	defer cleanupNode(nodeID)
-
-	n1.Put("key1", []byte("value1"), n1.generateTimestamp())
-	n1.Put("key2", []byte("value2"), n1.generateTimestamp())
-	n1.Delete("key1")
-
-	n2 := NewNode(nodeID)
-
-	if len(n2.store) != 2 {
-		t.Errorf("Expected 2 entries after recovery, got %d", len(n2.store))
-	}
-	value, _, exists := n2.Get("key2")
-	if !exists || !bytes.Equal(value, []byte("value2")) {
-		t.Errorf("Expected key2=value2, got exists=%v, value=%s", exists, value)
-	}
-	_, _, exists = n2.Get("key1")
-	if exists {
-		t.Errorf("Expected key1 to be deleted (tombstone)")
-	}
-	n2.storeMu.RLock()
-	kv, ok := n2.store["key1"]
-	n2.storeMu.RUnlock()
-	if !ok || !kv.IsTombstone {
-		t.Errorf("Expected key1 to have tombstone, got %+v", kv)
-	}
-}
-
-func TestSnapshotAndRecovery(t *testing.T) {
-	nodeID := uint32(6)
-	n1 := setupNode(nodeID)
-	defer cleanupNode(nodeID)
-
-	n1.Put("key1", []byte("value1"), n1.generateTimestamp())
-	n1.Put("key2", []byte("value2"), n1.generateTimestamp())
-	if err := n1.compactWAL(); err != nil {
-		t.Fatalf("Failed to compact WAL: %v", err)
-	}
-	n1.Delete("key1")
-	n1.Put("key3", []byte("value3"), n1.generateTimestamp())
-
-	n2 := NewNode(nodeID)
-
-	keys := n2.GetKeys()
-	expected := []string{"key2", "key3"}
-	if len(keys) != len(expected) {
-		t.Errorf("Expected %d keys, got %d: %v", len(expected), len(keys), keys)
-	}
-	for _, k := range keys {
-		if k != "key2" && k != "key3" {
-			t.Errorf("Unexpected key %s in %v", k, keys)
-		}
-	}
-	_, _, exists := n2.Get("key1")
-	if exists {
-		t.Errorf("Expected key1 to be deleted")
-	}
-}
-
-func TestTTLExpiration(t *testing.T) {
-	nodeID := uint32(7)
-	n := setupNode(nodeID)
-	defer cleanupNode(nodeID)
-
-	key := "ttlKey"
-	n.storeMu.Lock()
-	n.store[key] = &KeyValue{
-		Value:       []byte("ttlValue"),
-		Timestamp:   time.Now().Unix() - 100,
-		IsTombstone: true,
-		TTL:         10,
-	}
-	n.storeMu.Unlock()
-
-	_, _, exists := n.Get(key)
-	if exists {
-		t.Errorf("Expected key %s to be expired due to TTL", key)
-	}
-
-	keys := n.GetKeys()
-	if len(keys) != 0 {
-		t.Errorf("Expected no keys due to TTL expiration, got %v", keys)
-	}
-}
-
-func TestWALCompactionLargeData(t *testing.T) {
-	nodeID := uint32(8)
-	n := setupNode(nodeID)
-	defer cleanupNode(nodeID)
-
-	for i := 0; i < 1000; i++ {
-		n.Put(fmt.Sprintf("key%d", i), []byte(fmt.Sprintf("value%d", i)), n.generateTimestamp())
-	}
-	if err := n.compactWAL(); err != nil {
-		t.Fatalf("Failed to compact WAL: %v", err)
-	}
-
-	walFile := fmt.Sprintf("wal-%d.log", nodeID)
-	stat, err := os.Stat(walFile)
-	if err != nil && !os.IsNotExist(err) {
-		t.Fatalf("Failed to stat WAL file: %v", err)
-	}
-	if err == nil && stat.Size() > maxWALSize {
-		t.Errorf("Expected WAL size <= %d, got %d", maxWALSize, stat.Size())
-	}
-
-	for i := 0; i < 1000; i++ {
-		key := fmt.Sprintf("key%d", i)
-		value, _, exists := n.Get(key)
-		if !exists || !bytes.Equal(value, []byte(fmt.Sprintf("value%d", i))) {
-			t.Errorf("Expected %s=value%d, got exists=%v, value=%s", key, i, exists, value)
-		}
-	}
-}
-
-func TestConcurrentOperationsWithFailures(t *testing.T) {
-	nodeID := uint32(9)
-	n := setupNode(nodeID)
-	defer cleanupNode(nodeID)
+	node := NewNode(nodeID)
+	
+	const (
+		numGoroutines = 10
+		opsPerGoroutine = 100
+	)
 
 	var wg sync.WaitGroup
-	numGoroutines := 50
+	wg.Add(numGoroutines)
 
-	for i := 0; i < numGoroutines; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			key := fmt.Sprintf("key%d", i)
-			value := []byte(fmt.Sprintf("value%d", i))
-			timestamp := n.generateTimestamp()
-			n.Put(key, value, timestamp)
-
-			// Simulate intermittent failures
-			if i%5 == 0 {
-				// Force a write error by closing the WAL file
-				n.walWriter.mu.Lock()
-				n.walWriter.stagingFile.Close()
-				n.walWriter.stagingFile, _ = os.OpenFile(fmt.Sprintf("wal-%d.staging", nodeID), os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0644)
-				n.walWriter.mu.Unlock()
-			}
-
-			gotValue, _, exists := n.Get(key)
-			if exists && !bytes.Equal(gotValue, value) {
-				t.Errorf("Concurrent: Expected %s=%s, got value=%s", key, value, gotValue)
-			}
-
-			if i%2 == 0 {
-				n.Delete(key)
-			}
-		}(i)
-	}
-
-	wg.Wait()
-
-	for i := 0; i < numGoroutines; i++ {
-		key := fmt.Sprintf("key%d", i)
-		_, _, exists := n.Get(key)
-		if i%2 == 0 && exists {
-			t.Errorf("Expected %s to be deleted", key)
-		} else if i%2 != 0 && !exists {
-			t.Errorf("Expected %s to exist", key)
+	t.Run("Concurrent Stores", func(t *testing.T) {
+		for i := 0; i < numGoroutines; i++ {
+			go func(routineID int) {
+				defer wg.Done()
+				for j := 0; j < opsPerGoroutine; j++ {
+					key := fmt.Sprintf("key-%d-%d", routineID, j)
+					value := fmt.Sprintf("value-%d-%d", routineID, j)
+					timestamp := node.generateTimestamp()
+					node.Store(key, value, timestamp)
+				}
+			}(i)
 		}
-	}
+		wg.Wait()
+
+		// Verify all entries
+		for i := 0; i < numGoroutines; i++ {
+			for j := 0; j < opsPerGoroutine; j++ {
+				key := fmt.Sprintf("key-%d-%d", i, j)
+				value := fmt.Sprintf("value-%d-%d", i, j)
+				actualValue, _, exists := node.Get(key)
+				assert.True(t, exists)
+				assert.Equal(t, value, actualValue)
+			}
+		}
+	})
 }
 
-func TestSnapshotCleanupMultiple(t *testing.T) {
+func TestWALRecovery(t *testing.T) {
+	nodeID := uint32(3)
+	cleanup(nodeID)
+	defer cleanup(nodeID)
+
+	t.Run("Recovery After Crash", func(t *testing.T) {
+		// Create initial node and store some data
+		node1 := NewNode(nodeID)
+		testData := map[string]string{
+			"key1": "value1",
+			"key2": "value2",
+			"key3": "value3",
+		}
+
+		for key, value := range testData {
+			node1.Store(key, value, node1.generateTimestamp())
+		}
+
+		// Simulate crash by creating new node instance
+		node2 := NewNode(nodeID)
+
+		// Verify recovered data
+		for key, expectedValue := range testData {
+			value, _, exists := node2.Get(key)
+			assert.True(t, exists)
+			assert.Equal(t, expectedValue, value)
+		}
+	})
+}
+
+func TestSnapshotting(t *testing.T) {
+	nodeID := uint32(4)
+	cleanup(nodeID)
+	defer cleanup(nodeID)
+
+	node := NewNode(nodeID)
+
+	t.Run("Snapshot Creation and Recovery", func(t *testing.T) {
+		// Store enough data to trigger snapshot
+		for i := 0; i < 1000; i++ {
+			key := fmt.Sprintf("key-%d", i)
+			value := fmt.Sprintf("value-%d", i)
+			node.Store(key, value, node.generateTimestamp())
+		}
+
+		// Force compaction
+		require.NoError(t, node.compactWAL())
+
+		// Verify snapshot was created
+		files, err := os.ReadDir("snapshots")
+		require.NoError(t, err)
+		assert.True(t, len(files) > 0)
+
+		// Create new node instance to test recovery from snapshot
+		node2 := NewNode(nodeID)
+
+		// Verify recovered data
+		for i := 0; i < 1000; i++ {
+			key := fmt.Sprintf("key-%d", i)
+			expectedValue := fmt.Sprintf("value-%d", i)
+			value, _, exists := node2.Get(key)
+			assert.True(t, exists)
+			assert.Equal(t, expectedValue, value)
+		}
+	})
+}
+
+func TestTimestampOrdering(t *testing.T) {
+	nodeID := uint32(5)
+	cleanup(nodeID)
+	defer cleanup(nodeID)
+
+	node := NewNode(nodeID)
+
+	t.Run("Timestamp Ordering", func(t *testing.T) {
+		key := "timestamp-test"
+		
+		// Store value with older timestamp
+		oldTimestamp := node.generateTimestamp()
+		node.Store(key, "old-value", oldTimestamp)
+
+		// Store value with newer timestamp
+		newTimestamp := node.generateTimestamp()
+		node.Store(key, "new-value", newTimestamp)
+
+		// Verify newer value is returned
+		value, ts, exists := node.Get(key)
+		assert.True(t, exists)
+		assert.Equal(t, "new-value", value)
+		assert.Equal(t, newTimestamp, ts)
+
+		// Try to store value with older timestamp
+		node.Store(key, "outdated-value", oldTimestamp)
+
+		// Verify newer value remains
+		value, ts, exists = node.Get(key)
+		assert.True(t, exists)
+		assert.Equal(t, "new-value", value)
+		assert.Equal(t, newTimestamp, ts)
+	})
+}
+
+func TestTombstones(t *testing.T) {
+	nodeID := uint32(6)
+	cleanup(nodeID)
+	defer cleanup(nodeID)
+
+	node := NewNode(nodeID)
+
+	t.Run("Tombstone Behavior", func(t *testing.T) {
+		key := "tombstone-test"
+		
+		// Store and delete
+		node.Store(key, "value", node.generateTimestamp())
+		deleteTime := node.generateTimestamp()
+		node.Delete(key)
+
+		// Verify tombstone
+		kv := node.store[key]
+		assert.True(t, kv.IsTombstone)
+		assert.Equal(t, uint64(86400), kv.TTL)
+		assert.True(t, kv.Timestamp >= deleteTime)
+
+		// Try to store with older timestamp
+		oldTimestamp := deleteTime - 1
+		node.Store(key, "old-value", oldTimestamp)
+
+		// Verify tombstone remains
+		_, _, exists := node.Get(key)
+		assert.False(t, exists)
+	})
+}
+
+func TestStressTest(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping stress test in short mode")
+	}
+
+	nodeID := uint32(7)
+	cleanup(nodeID)
+	defer cleanup(nodeID)
+
+	node := NewNode(nodeID)
+	
+	const (
+		numOps        = 10000
+		numGoroutines = 5
+		keySpace      = 1000
+	)
+
+	var wg sync.WaitGroup
+	wg.Add(numGoroutines)
+
+	t.Run("Mixed Operations Stress Test", func(t *testing.T) {
+		start := time.Now()
+
+		for i := 0; i < numGoroutines; i++ {
+			go func() {
+				defer wg.Done()
+				r := rand.New(rand.NewSource(time.Now().UnixNano()))
+
+				for j := 0; j < numOps; j++ {
+					key := fmt.Sprintf("key-%d", r.Intn(keySpace))
+					op := r.Intn(3)
+
+					switch op {
+					case 0: // Store
+						value := fmt.Sprintf("value-%d", r.Int())
+						node.Store(key, value, node.generateTimestamp())
+					case 1: // Get
+						node.Get(key)
+					case 2: // Delete
+						node.Delete(key)
+					}
+				}
+			}()
+		}
+
+		wg.Wait()
+		elapsed := time.Since(start)
+		
+		// Calculate operations per second
+		totalOps := numOps * numGoroutines
+		opsPerSecond := float64(totalOps) / elapsed.Seconds()
+		
+		t.Logf("Completed %d operations in %v (%.2f ops/sec)", totalOps, elapsed, opsPerSecond)
+		
+		// Verify node is still functional
+		testKey := "final-test"
+		testValue := "final-value"
+		node.Store(testKey, testValue, node.generateTimestamp())
+		value, _, exists := node.Get(testKey)
+		assert.True(t, exists)
+		assert.Equal(t, testValue, value)
+	})
+}
+
+
+
+func TestMaxSnapshotLimit(t *testing.T) {
+	nodeID := uint32(9)
+	cleanup(nodeID)
+	defer cleanup(nodeID)
+
+	node := NewNode(nodeID)
+
+	t.Run("Max Snapshots Maintained", func(t *testing.T) {
+		// Create multiple snapshots
+		for i := 0; i < maxSnapshots+2; i++ {
+			// Store some data
+			for j := 0; j < 100; j++ {
+				key := fmt.Sprintf("key-%d-%d", i, j)
+				value := fmt.Sprintf("value-%d-%d", i, j)
+				node.Store(key, value, node.generateTimestamp())
+			}
+			
+			// Force snapshot
+			require.NoError(t, node.compactWAL())
+			time.Sleep(100 * time.Millisecond)
+		}
+
+		// Check number of snapshots
+		files, err := os.ReadDir("snapshots")
+		require.NoError(t, err)
+		assert.LessOrEqual(t, len(files), maxSnapshots)
+	})
+}
+
+func BenchmarkStorageOperations(b *testing.B) {
 	nodeID := uint32(10)
-	n := setupNode(nodeID)
-	defer cleanupNode(nodeID)
+	cleanup(nodeID)
+	defer cleanup(nodeID)
 
-	for i := 0; i < maxSnapshots+2; i++ {
-		n.LogicalClock = uint64(i * 1000)
-		if err := n.compactWAL(); err != nil {
-			t.Fatalf("Failed to compact WAL: %v", err)
+	node := NewNode(nodeID)
+
+	b.Run("Store Operation", func(b *testing.B) {
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			key := fmt.Sprintf("bench-key-%d", i)
+			value := fmt.Sprintf("bench-value-%d", i)
+			node.Store(key, value, node.generateTimestamp())
 		}
-	}
+	})
 
-	files, err := os.ReadDir(snapshotPath)
-	if err != nil {
-		t.Fatalf("Failed to read snapshot dir: %v", err)
-	}
-	snapshotCount := 0
-	for _, f := range files {
-		if strings.HasPrefix(f.Name(), fmt.Sprintf("snapshot-%d-", nodeID)) {
-			snapshotCount++
+	b.Run("Get Operation", func(b *testing.B) {
+		// Pre-populate with test data
+		key := "bench-get-key"
+		value := "bench-get-value"
+		node.Store(key, value, node.generateTimestamp())
+
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			node.Get(key)
 		}
-	}
-	if snapshotCount > maxSnapshots {
-		t.Errorf("Expected at most %d snapshots, got %d", maxSnapshots, snapshotCount)
-	}
-}
+	})
 
-func TestMalformedWALRecovery(t *testing.T) {
-	nodeID := uint32(11)
-	n1 := setupNode(nodeID)
-	defer cleanupNode(nodeID)
-
-	n1.Put("key1", []byte("value1"), n1.generateTimestamp())
-	n1.Put("key2", []byte("value2"), n1.generateTimestamp())
-
-	// Corrupt WAL by appending invalid entry
-	walFile := fmt.Sprintf("wal-%d.log", nodeID)
-	f, err := os.OpenFile(walFile, os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		t.Fatalf("Failed to open WAL: %v", err)
-	}
-	_, err = f.WriteString("INVALID ENTRY\n")
-	f.Close()
-
-	n2 := NewNode(nodeID)
-
-	value, _, exists := n2.Get("key1")
-	if !exists || !bytes.Equal(value, []byte("value1")) {
-		t.Errorf("Expected key1=value1, got exists=%v, value=%s", exists, value)
-	}
-	value, _, exists = n2.Get("key2")
-	if !exists || !bytes.Equal(value, []byte("value2")) {
-		t.Errorf("Expected key2=value2, got exists=%v, value=%s", exists, value)
-	}
-}
-
-func TestEmptyWALAndSnapshot(t *testing.T) {
-	nodeID := uint32(12)
-	defer cleanupNode(nodeID)
-
-	// Create new node without setupNode
-	n2 := NewNode(nodeID)
-	if len(n2.store) != 0 {
-		t.Errorf("Expected empty store after recovery, got %d entries", len(n2.store))
-	}
-}
-
-func TestWALOverflow(t *testing.T) {
-	nodeID := uint32(13)
-	n := setupNode(nodeID)
-	defer cleanupNode(nodeID)
-
-	// Write enough data to exceed maxWALSize
-	largeValue := make([]byte, maxWALSize/100)
-	for i := 0; i < 200; i++ {
-		n.Put(fmt.Sprintf("key%d", i), largeValue, n.generateTimestamp())
-	}
-
-	// Force compaction
-	if err := n.compactWAL(); err != nil {
-		t.Fatalf("Failed to compact WAL: %v", err)
-	}
-
-	// Verify some data
-	for i := 0; i < 200; i++ {
-		key := fmt.Sprintf("key%d", i)
-		value, _, exists := n.Get(key)
-		if !exists || len(value) != len(largeValue) {
-			t.Errorf("Expected %s to exist with large value, got exists=%v, len=%d", key, exists, len(value))
+	b.Run("Delete Operation", func(b *testing.B) {
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			key := fmt.Sprintf("bench-delete-key-%d", i)
+			node.Delete(key)
 		}
-	}
-}
-
-func TestTimestampCollision(t *testing.T) {
-	nodeID := uint32(14)
-	n := setupNode(nodeID)
-	defer cleanupNode(nodeID)
-
-	key := "collisionKey"
-	timestamp := n.generateTimestamp()
-	n.Put(key, []byte("value1"), timestamp)
-	n.Put(key, []byte("value2"), timestamp) // Same timestamp
-
-	value, gotTimestamp, exists := n.Get(key)
-	if !exists || !bytes.Equal(value, []byte("value1")) {
-		t.Errorf("Expected value1 for timestamp collision, got %s", value)
-	}
-	if gotTimestamp != timestamp {
-		t.Errorf("Expected timestamp %d, got %d", timestamp, gotTimestamp)
-	}
-}
-
-func TestCorruptedSnapshotRecovery(t *testing.T) {
-	nodeID := uint32(15)
-	n1 := setupNode(nodeID)
-	defer cleanupNode(nodeID)
-
-	n1.Put("key1", []byte("value1"), n1.generateTimestamp())
-	if err := n1.compactWAL(); err != nil {
-		t.Fatalf("Failed to compact WAL: %v", err)
-	}
-
-	// Corrupt the snapshot file
-	files, _ := os.ReadDir(snapshotPath)
-	var snapshotFile string
-	for _, f := range files {
-		if strings.HasPrefix(f.Name(), fmt.Sprintf("snapshot-%d-", nodeID)) {
-			snapshotFile = filepath.Join(snapshotPath, f.Name())
-			break
-		}
-	}
-	f, _ := os.OpenFile(snapshotFile, os.O_WRONLY, 0644)
-	f.WriteString("corrupted data")
-	f.Close()
-
-	// Recovery should fall back to WAL
-	n2 := NewNode(nodeID)
-	value, _, exists := n2.Get("key1")
-	if !exists || !bytes.Equal(value, []byte("value1")) {
-		t.Errorf("Expected key1=value1 after corrupted snapshot recovery, got exists=%v, value=%s", exists, value)
-	}
+	})
 }

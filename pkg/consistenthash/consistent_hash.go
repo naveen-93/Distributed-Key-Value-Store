@@ -44,7 +44,7 @@ func (r *Ring) AddNode(node string) {
 	hashes := make([]uint32, 0, r.vnodeCount)
 	for i := 0; i < r.vnodeCount; i++ {
 		vnode := fmt.Sprintf("%s-%d", node, i)
-		hash := r.hashKey(vnode)
+		hash := r.HashKey(vnode)
 
 		// Check if the hash already exists in the mapping
 		if _, exists := r.mapping[hash]; !exists {
@@ -93,7 +93,7 @@ func (r *Ring) GetNode(key string) string {
 		return ""
 	}
 
-	hash := r.hashKey(key)
+	hash := r.HashKey(key)
 	idx := sort.Search(len(r.hashRing), func(i int) bool {
 		return r.hashRing[i] >= hash
 	})
@@ -126,7 +126,7 @@ func (r *Ring) GetNextNode(hash uint32) string {
 }
 
 // HashKey generates a hash for a string using MurmurHash3
-func (r *Ring) hashKey(s string) uint32 {
+func (r *Ring) HashKey(s string) uint32 {
 	r.hashFunc.Reset()
 	r.hashFunc.Write([]byte(s))
 	return r.hashFunc.Sum32()
@@ -152,7 +152,7 @@ func (r *Ring) GetReplicas(key string, count int) []string {
 		return nil
 	}
 
-	hash := r.hashKey(key)
+	hash := r.HashKey(key)
 	idx := sort.Search(len(r.hashRing), func(i int) bool {
 		return r.hashRing[i] >= hash
 	})

@@ -1,5 +1,6 @@
 package protocol
 
+
 import (
 	"context"
 	"log"
@@ -12,6 +13,9 @@ import (
 	"Distributed-Key-Value-Store/pkg/consistenthash"
 
 	"google.golang.org/grpc"
+	"fmt"
+	"strconv"
+	"strings"
 )
 
 type Node struct {
@@ -39,6 +43,7 @@ type Node struct {
 
 	// Ring state
 	ringVersion uint64
+	stopChan     chan struct{}
 }
 
 func NewNode(id uint32, store *node.Node) *Node {
@@ -52,13 +57,14 @@ func NewNode(id uint32, store *node.Node) *Node {
 		heartbeatInterval: time.Second,
 		ring:              consistenthash.NewRing(10),
 		ringVersion:       0,
+		stopChan:  make(chan struct{}),
 	}
 }
 
 // Replicate handles incoming replication requests
 func (n *Node) Replicate(ctx context.Context, req *pb.ReplicateRequest) (*pb.ReplicateResponse, error) {
 	_, timestamp, exists := n.store.Get(req.Key)
-	if !exists || req.Timestamp > timestamp {
+	if !exists || (req.Timestamp) > timestamp {
 		n.store.Store(req.Key, req.Value, req.Timestamp)
 		return &pb.ReplicateResponse{Success: true}, nil
 	}
@@ -87,11 +93,11 @@ func (n *Node) SyncKeys(ctx context.Context, req *pb.SyncRequest) (*pb.SyncRespo
 
 			if !exists {
 				// Track deletions
-				deletions[key] = timestamp
-			} else if timestamp > remoteTs {
+				deletions[key] = uint64(timestamp)
+			} else if int64(timestamp) > int64(remoteTs) {
 				missing[key] = &pb.KeyValue{
-					Value:     value,
-					Timestamp: timestamp,
+					Value:     string(value),
+					Timestamp: uint64(timestamp),
 					Deleted:   !exists,
 				}
 			}
@@ -140,7 +146,7 @@ func (n *Node) performAntiEntropy() {
 				if key >= start && key < end {
 					_, timestamp, exists := n.store.Get(key)
 					if exists {
-						keyTimestamps[key] = timestamp
+						keyTimestamps[key] = uint64(timestamp)
 					}
 				}
 			}
@@ -164,7 +170,7 @@ func (n *Node) performAntiEntropy() {
 				n.store.Store(key, kv.Value, kv.Timestamp)
 			}
 			for key, ts := range resp.Deletions {
-				if _, existing, exists := n.store.Get(key); !exists || ts > existing {
+				if _, existing, exists := n.store.Get(key); !exists || (ts) > existing {
 					n.store.Store(key, "", ts)
 				}
 			}
@@ -206,7 +212,7 @@ func (n *Node) getTimestamp(key string) uint64 {
 // getLocalTimestamp retrieves the stored timestamp without incrementing
 func (n *Node) getLocalTimestamp(key string) uint64 {
 	_, timestamp, _ := n.store.Get(key)
-	return timestamp
+	return uint64(timestamp)
 }
 
 // updateTimestamp updates logical clock based on received timestamp
@@ -234,34 +240,137 @@ func (n *Node) getClients() map[uint32]pb.NodeInternalClient {
 func (n *Node) StartHeartbeat() {
 	go func() {
 		ticker := time.NewTicker(n.heartbeatInterval)
+		// Track consecutive failures
+		failureCount := make(map[uint32]int)
+		// Number of consecutive failures before marking a node as down
+		failureThreshold := 3
+
 		for range ticker.C {
 			anyStateChanged := false
 			n.statusMu.Lock()
-			for nodeID, _ := range n.nodes {
+			for nodeID := range n.nodes {
 				if nodeID == n.ID {
 					continue
 				}
-				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 				_, err := n.clients[nodeID].Heartbeat(ctx, &pb.Ping{NodeId: n.ID})
 				cancel()
 
-				// Update node status and track changes
-				newStatus := (err == nil)
+				// Update failure count and node status
+				if err != nil {
+					failureCount[nodeID]++
+					// Log increasing failures
+					if failureCount[nodeID] > 1 {
+						log.Printf("Node %d heartbeat failed %d times consecutively", nodeID, failureCount[nodeID])
+					}
+				} else {
+					failureCount[nodeID] = 0
+				}
+
+				// Mark node as down after threshold failures
+				newStatus := failureCount[nodeID] < failureThreshold
 				if n.nodeStatus[nodeID] != newStatus {
 					n.nodeStatus[nodeID] = newStatus
 					anyStateChanged = true
+					if !newStatus {
+						log.Printf("Node %d marked as down after %d consecutive failures", nodeID, failureThreshold)
+					} else {
+						log.Printf("Node %d is back online", nodeID)
+					}
 				}
 			}
 			n.statusMu.Unlock()
 
-			// Update ring version if any node status changed
+			// Trigger ring update and rebalancing if needed
 			if anyStateChanged {
 				n.storeMu.Lock()
 				n.ringVersion++
+				// Trigger immediate rebalancing
+				go n.rebalanceRing()
 				n.storeMu.Unlock()
 			}
 		}
 	}()
+}
+
+// rebalanceRing handles the rebalancing of keys after node status changes
+func (n *Node) rebalanceRing() {
+	// Acquire a read lock to get the current state
+	n.statusMu.RLock()
+	activeNodes := make([]uint32, 0)
+	for nodeID, status := range n.nodeStatus {
+		if status {
+			activeNodes = append(activeNodes, nodeID)
+		}
+	}
+	n.statusMu.RUnlock()
+
+	// Update the ring with only active nodes
+	n.storeMu.Lock()
+	for nodeID := range n.nodes {
+		n.ring.RemoveNode(fmt.Sprintf("node-%d", nodeID))
+	}
+	for _, nodeID := range activeNodes {
+		n.ring.AddNode(fmt.Sprintf("node-%d", nodeID))
+	}
+	n.storeMu.Unlock()
+
+	// Rebalance keys
+	keys := n.store.GetKeys()
+	for _, key := range keys {
+		// Calculate the new node for each key
+		hash := n.ring.HashKey(key)
+		newNodeID := n.ring.GetNode(fmt.Sprintf("%d", hash))
+
+		// If the key should be on a different node, initiate transfer
+		if newNodeID != fmt.Sprintf("node-%d", n.ID) {
+			value, timestamp, exists := n.store.Get(key)
+			if exists {
+				// Attempt to replicate with retries
+				go func(k, v string, ts uint64, target string) {
+					for retries := 0; retries < 3; retries++ {
+						if err := n.replicateKey(k, v, ts, target); err != nil {
+							log.Printf("Failed to replicate key %s to %s (attempt %d/3): %v", 
+								k, target, retries+1, err)
+							time.Sleep(time.Second * time.Duration(retries+1))
+							continue
+						}
+						return
+					}
+				}(key, string(value), timestamp, newNodeID)
+			}
+		}
+	}
+}
+
+
+// replicateKey handles the replication of a single key to a target node
+func (n *Node) replicateKey(key, value string, timestamp uint64, targetNode string) error {
+	// Extract node ID from target node string
+	targetID, err := strconv.ParseUint(strings.TrimPrefix(targetNode, "node-"), 10, 32)
+	if err != nil {
+		return fmt.Errorf("invalid target node format: %v", err)
+	}
+
+	// Get client for target node
+	client, ok := n.clients[uint32(targetID)]
+	if !ok {
+		return fmt.Errorf("no client found for node %d", targetID)
+	}
+
+	// Send replication request
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req := &pb.ReplicateRequest{
+		Key:       key,
+		Value:     value,
+		Timestamp: timestamp,
+	}
+
+	_, err = client.Replicate(ctx, req)
+	return err
 }
 
 // ReplicateToNodes sends updates only to designated replica nodes
@@ -281,7 +390,7 @@ func (n *Node) replicateToNodes(key string, value string, timestamp uint64) {
 	replicasSent := 1 // Count self as first replica
 
 	// Start from the primary node's hash
-	currentHash := consistenthash.HashString(key)
+	currentHash := n.ring.HashKey(key)
 
 	// Send to next nodes in the ring
 	for replicasSent < replicaCount {
@@ -292,7 +401,7 @@ func (n *Node) replicateToNodes(key string, value string, timestamp uint64) {
 		}
 
 		// Convert node address to ID and send if it's not self
-		nodeID := uint32(consistenthash.HashString(nextNodeID))
+		nodeID := uint32(n.ring.HashKey(nextNodeID))
 		if client, exists := n.clients[nodeID]; exists {
 			go func(c pb.NodeInternalClient) {
 				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -306,12 +415,12 @@ func (n *Node) replicateToNodes(key string, value string, timestamp uint64) {
 			replicasSent++
 		}
 
-		currentHash = n.ring.GetNodeHash(nextNodeID)
+		currentHash = n.ring.HashKey(nextNodeID)
 	}
 }
 
 func (n *Node) IsPrimary(key string) bool {
-	hash := consistenthash.HashString(key) % uint32(len(n.nodes))
+	hash := n.ring.HashKey(key) % uint32(len(n.nodes))
 	return n.ID == hash
 }
 
@@ -328,7 +437,7 @@ func (n *Node) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, er
 	n.replicateToNodes(req.Key, req.Value, timestamp)
 
 	return &pb.PutResponse{
-		OldValue:    oldValue,
+		OldValue:    string(oldValue),
 		HadOldValue: hadOldValue,
 	}, nil
 }
@@ -389,7 +498,7 @@ func (n *Node) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, er
 	value, timestamp, exists := n.store.Get(req.Key)
 
 	// Get replica nodes for this key
-	currentHash := consistenthash.HashString(req.Key)
+	currentHash := n.ring.HashKey(req.Key)
 	replicaValues := make([]struct {
 		value     string
 		timestamp uint64
@@ -402,7 +511,7 @@ func (n *Node) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, er
 			value     string
 			timestamp uint64
 			nodeID    uint32
-		}{value, timestamp, n.ID})
+		}{string(value), uint64(timestamp), n.ID})
 	}
 
 	// Query other replicas
@@ -412,7 +521,7 @@ func (n *Node) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, er
 			break
 		}
 
-		nodeID := uint32(consistenthash.HashString(nextNodeID))
+		nodeID := uint32(n.ring.HashKey(nextNodeID))
 		if client, ok := n.clients[nodeID]; ok {
 			// Use SyncKeys for node-to-node communication
 			resp, err := client.SyncKeys(ctx, &pb.SyncRequest{
@@ -428,7 +537,7 @@ func (n *Node) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, er
 				}
 			}
 		}
-		currentHash = n.ring.GetNodeHash(nextNodeID)
+		currentHash = n.ring.HashKey(nextNodeID)
 	}
 
 	// Find latest value
@@ -447,7 +556,7 @@ func (n *Node) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, er
 	}
 
 	// Perform read repair if needed
-	if latest.exists && latest.timestamp > timestamp {
+	if latest.exists && (latest.timestamp) > timestamp {
 		go n.store.Store(req.Key, latest.value, latest.timestamp)
 	}
 
@@ -480,4 +589,10 @@ func (n *Node) GetRingState(ctx context.Context, req *pb.RingStateRequest) (*pb.
 	n.storeMu.RUnlock()
 
 	return state, nil
+}
+func (n *Node) Stop() {
+    close(n.stopChan)
+    if err := n.store.Shutdown(); err != nil {
+        log.Printf("Error shutting down store: %v", err)
+    }
 }
