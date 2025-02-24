@@ -32,15 +32,23 @@ type server struct {
 	// Node management
 	peers   map[uint32]string
 	clients map[uint32]pb.NodeInternalClient
+
+	// Configuration
+	syncInterval      time.Duration
+	heartbeatInterval time.Duration
+	replicationFactor int
 }
 
 func NewServer(nodeID uint32) *server {
 	s := &server{
-		nodeID:  nodeID,
-		store:   &node.Node{ID: nodeID},
-		ring:    consistenthash.NewRing(consistenthash.DefaultVirtualNodes),
-		peers:   make(map[uint32]string),
-		clients: make(map[uint32]pb.NodeInternalClient),
+		nodeID:            nodeID,
+		store:             node.NewNode(nodeID),
+		ring:              consistenthash.NewRing(consistenthash.DefaultVirtualNodes),
+		peers:             make(map[uint32]string),
+		clients:           make(map[uint32]pb.NodeInternalClient),
+		syncInterval:      5 * time.Minute,
+		heartbeatInterval: time.Second,
+		replicationFactor: 3,
 	}
 
 	// Add self to ring
@@ -68,6 +76,142 @@ func (s *server) addPeer(peerID uint32, addr string) error {
 	s.rebalanceRing()
 
 	return nil
+}
+
+// Get implements the KVStore Get RPC method
+func (s *server) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, error) {
+	// Get local value
+	value, timestamp, exists := s.store.Get(req.Key)
+	if !exists {
+		return &pb.GetResponse{
+			Exists: false,
+		}, nil
+	}
+
+	// Query replicas for potentially newer values
+	replicaValues := make([]struct {
+		value     string
+		timestamp uint64
+	}, 0)
+
+	// Add local value
+	replicaValues = append(replicaValues, struct {
+		value     string
+		timestamp uint64
+	}{string(value), timestamp})
+
+	// Find the latest value among replicas
+	var latest struct {
+		value     string
+		timestamp uint64
+	}
+
+	for _, rv := range replicaValues {
+		if rv.timestamp > latest.timestamp {
+			latest.value = rv.value
+			latest.timestamp = rv.timestamp
+		}
+	}
+
+	// Perform read repair if needed
+	if latest.timestamp > timestamp {
+		go s.store.Store(req.Key, latest.value, latest.timestamp)
+	}
+
+	return &pb.GetResponse{
+		Value:     latest.value,
+		Exists:    true,
+		Timestamp: latest.timestamp,
+	}, nil
+}
+
+// Put implements the KVStore Put RPC method
+func (s *server) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
+	// Store value locally first
+	err := s.store.Store(req.Key, req.Value, req.Timestamp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to store value: %v", err)
+	}
+
+	// Get the old value for the response
+	oldValue, oldTimestamp, hadOld := s.store.Get(req.Key)
+
+	// Replicate to other nodes asynchronously
+	go s.replicateToNodes(req.Key, req.Value, req.Timestamp)
+
+	return &pb.PutResponse{
+		OldValue:     oldValue,
+		HadOldValue:  hadOld,
+		OldTimestamp: oldTimestamp,
+	}, nil
+}
+
+// Replicate implements the NodeInternal Replicate RPC method
+func (s *server) Replicate(ctx context.Context, req *pb.ReplicateRequest) (*pb.ReplicateResponse, error) {
+	// Check if we have a newer value
+	_, timestamp, exists := s.store.Get(req.Key)
+	if !exists || req.Timestamp > timestamp {
+		// Store the replicated value
+		if err := s.store.Store(req.Key, req.Value, req.Timestamp); err != nil {
+			return &pb.ReplicateResponse{
+				Success: false,
+				Error:   fmt.Sprintf("failed to store replicated value: %v", err),
+			}, nil
+		}
+		return &pb.ReplicateResponse{Success: true}, nil
+	}
+
+	return &pb.ReplicateResponse{
+		Success: false,
+		Error:   "have newer value",
+	}, nil
+}
+
+// GetRingState implements the NodeInternal GetRingState RPC method
+func (s *server) GetRingState(ctx context.Context, req *pb.RingStateRequest) (*pb.RingStateResponse, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	nodes := make(map[string]bool)
+	for id, _ := range s.peers {
+		nodes[fmt.Sprintf("node-%d", id)] = true
+	}
+	// Add self
+	nodes[fmt.Sprintf("node-%d", s.nodeID)] = true
+
+	return &pb.RingStateResponse{
+		Version:   uint64(time.Now().UnixNano()),
+		Nodes:     nodes,
+		UpdatedAt: time.Now().Unix(),
+	}, nil
+}
+
+// replicateToNodes handles asynchronous replication to other nodes
+func (s *server) replicateToNodes(key, value string, timestamp uint64) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	req := &pb.ReplicateRequest{
+		Key:       key,
+		Value:     value,
+		Timestamp: timestamp,
+	}
+
+	for nodeID, client := range s.clients {
+		if nodeID == s.nodeID {
+			continue // Skip self
+		}
+
+		go func(c pb.NodeInternalClient) {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+
+			_, err := c.Replicate(ctx, req)
+			if err != nil {
+				log.Printf("Failed to replicate to node: %v", err)
+			}
+		}(client)
+	}
 }
 
 func (s *server) rebalanceRing() {
@@ -158,5 +302,8 @@ func main() {
 	<-sigChan
 	log.Println("Shutting down...")
 	grpcServer.GracefulStop()
+	if err := srv.store.Shutdown(); err != nil {
+		log.Printf("Error during shutdown: %v", err)
+	}
 	log.Println("Server stopped")
 }

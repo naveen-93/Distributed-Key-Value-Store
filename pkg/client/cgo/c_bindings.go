@@ -1,4 +1,4 @@
-package client
+package main
 
 // #include <stdlib.h>
 // #include <string.h>

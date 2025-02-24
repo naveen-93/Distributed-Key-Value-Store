@@ -332,10 +332,6 @@ func (n *Node) compactWAL() error {
         return fmt.Errorf("failed to create snapshot directory: %v", err)
     }
 
-    // Handle WAL compaction with proper locking
-    if err := n.handleWALCompaction(&snapshot); err != nil {
-        return fmt.Errorf("WAL compaction failed: %v", err)
-    }
 	var err error
     maxRetries := 3
     for retry := 0; retry < maxRetries; retry++ {
@@ -353,10 +349,7 @@ func (n *Node) compactWAL() error {
 
 // New helper method for WAL compaction
 func (n *Node) handleWALCompaction(snapshot *Snapshot) error {
-	// Create snapshots directory if it doesn't exist
-    if err := os.MkdirAll(snapshotPath, 0755); err != nil {
-        return fmt.Errorf("failed to create snapshot directory: %v", err)
-    }
+	
 
     // Verify write permissions
     testFile := filepath.Join(snapshotPath, "write_test.tmp")
