@@ -3,13 +3,18 @@ package consistenthash
 import (
 	"fmt"
 	"hash"
+	"math/rand"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/spaolacci/murmur3"
 )
 
-const DefaultVirtualNodes = 10
+const (
+	DefaultVirtualNodes = 10
+	MaxAttemptsMultiplier = 100 // Increased multiplier for more collision attempts
+)
 
 // Ring represents a consistent hash ring
 type Ring struct {
@@ -19,16 +24,21 @@ type Ring struct {
 	vnodes     map[string][]uint32 // Node to virtual nodes mapping
 	vnodeCount int                 // Number of virtual nodes per node
 	hashFunc   hash.Hash32         // Hash function
+	randSource *rand.Rand          // Random source for unique suffixes
 }
 
 // NewRing creates a new consistent hashing ring
 func NewRing(vnodeCount int) *Ring {
+	if vnodeCount <= 0 {
+		vnodeCount = DefaultVirtualNodes
+	}
 	return &Ring{
 		hashRing:   make([]uint32, 0),
 		mapping:    make(map[uint32]string),
 		vnodes:     make(map[string][]uint32),
 		vnodeCount: vnodeCount,
 		hashFunc:   murmur3.New32(),
+		randSource: rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 }
 
@@ -42,15 +52,35 @@ func (r *Ring) AddNode(node string) {
 	}
 
 	hashes := make([]uint32, 0, r.vnodeCount)
-	for i := 0; i < r.vnodeCount; i++ {
-		vnode := fmt.Sprintf("%s-%d", node, i)
-		hash := r.HashKey(vnode)
+	attempts := 0
+	collisions := 0
+	maxAttempts := r.vnodeCount * MaxAttemptsMultiplier
 
-		// Check if the hash already exists in the mapping
-		if _, exists := r.mapping[hash]; !exists {
-			hashes = append(hashes, hash)
-			r.mapping[hash] = node
+	for i := 0; i < r.vnodeCount && attempts < maxAttempts; {
+		// Generate unique suffix using node, index, and random component
+		uniqueSuffix := r.randSource.Intn(1000000)
+		vnodeKey := fmt.Sprintf("%s-vnode-%d-%d", node, i, uniqueSuffix)
+		hash := r.HashKey(vnodeKey)
+
+		if _, exists := r.mapping[hash]; exists {
+			collisions++
+			attempts++
+			continue
 		}
+
+		hashes = append(hashes, hash)
+		r.mapping[hash] = node
+		i++
+		attempts++
+	}
+
+	if collisions > 0 {
+		fmt.Printf("Warning: Node %s experienced %d hash collisions while adding virtual nodes\n", node, collisions)
+	}
+
+	if len(hashes) < r.vnodeCount {
+		fmt.Printf("Warning: Node %s could only add %d/%d virtual nodes due to excessive collisions\n", 
+			node, len(hashes), r.vnodeCount)
 	}
 
 	r.vnodes[node] = hashes
@@ -72,8 +102,7 @@ func (r *Ring) RemoveNode(node string) {
 			hashSet[h] = struct{}{}
 		}
 
-		// Efficiently remove virtual nodes from the sorted ring
-		newRing := r.hashRing[:0]
+		newRing := make([]uint32, 0, len(r.hashRing)-len(vnodes))
 		for _, h := range r.hashRing {
 			if _, found := hashSet[h]; !found {
 				newRing = append(newRing, h)
@@ -152,6 +181,11 @@ func (r *Ring) GetReplicas(key string, count int) []string {
 		return nil
 	}
 
+	uniqueNodes := len(r.vnodes)
+	if count > uniqueNodes {
+		count = uniqueNodes
+	}
+
 	hash := r.HashKey(key)
 	idx := sort.Search(len(r.hashRing), func(i int) bool {
 		return r.hashRing[i] >= hash
@@ -164,8 +198,7 @@ func (r *Ring) GetReplicas(key string, count int) []string {
 	replicas := make([]string, 0, count)
 	seen := make(map[string]struct{})
 
-	steps := 0
-	for len(replicas) < count && steps < len(r.hashRing) {
+	for len(replicas) < count {
 		node := r.mapping[r.hashRing[idx]]
 		if _, exists := seen[node]; !exists {
 			replicas = append(replicas, node)
@@ -173,7 +206,11 @@ func (r *Ring) GetReplicas(key string, count int) []string {
 		}
 
 		idx = (idx + 1) % len(r.hashRing)
-		steps++
+
+		// Break early if all nodes are exhausted
+		if len(seen) == uniqueNodes {
+			break
+		}
 	}
 
 	return replicas

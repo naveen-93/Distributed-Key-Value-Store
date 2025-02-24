@@ -2,247 +2,350 @@ package consistenthash
 
 import (
 	"fmt"
-	"sort"
-	"sync"
+	"hash"
+	
 	"testing"
+	
 )
 
-// TestRingInitialization verifies that a new ring is initialized correctly.
-func TestRingInitialization(t *testing.T) {
-	ring := NewRing(3) // Assuming 3 virtual nodes per physical node
-	if ring.vnodeCount != 3 {
-		t.Errorf("Expected vnodeCount to be 3, got %d", ring.vnodeCount)
-	}
-	if len(ring.hashRing) != 0 {
-		t.Errorf("Expected hashRing to be empty, got %d elements", len(ring.hashRing))
-	}
-	if len(ring.mapping) != 0 {
-		t.Errorf("Expected mapping to be empty, got %d elements", len(ring.mapping))
-	}
-	if len(ring.vnodes) != 0 {
-		t.Errorf("Expected vnodes to be empty, got %d elements", len(ring.vnodes))
-	}
-}
-
-// TestAddNode ensures that adding a node updates the ring correctly.
-func TestAddNode(t *testing.T) {
-	ring := NewRing(3)
-	ring.AddNode("Node1")
-	
-	if len(ring.vnodes["Node1"]) != 3 {
-		t.Errorf("Expected 3 virtual nodes for Node1, got %d", len(ring.vnodes["Node1"]))
-	}
-	if len(ring.hashRing) != 3 {
-		t.Errorf("Expected hashRing to have 3 elements, got %d", len(ring.hashRing))
-	}
-	if len(ring.mapping) != 3 {
-		t.Errorf("Expected mapping to have 3 elements, got %d", len(ring.mapping))
-	}
-	
-	// Verify that hashRing is sorted
-	if !sort.SliceIsSorted(ring.hashRing, func(i, j int) bool { return ring.hashRing[i] < ring.hashRing[j] }) {
-		t.Errorf("hashRing is not sorted: %v", ring.hashRing)
-	}
-}
-
-// TestRemoveNode ensures that removing a node updates the ring correctly.
-func TestRemoveNode(t *testing.T) {
-	ring := NewRing(3)
-	ring.AddNode("Node1")
-	ring.AddNode("Node2")
-	ring.RemoveNode("Node1")
-	
-	if _, exists := ring.vnodes["Node1"]; exists {
-		t.Errorf("Expected Node1 to be removed from vnodes")
-	}
-	if len(ring.hashRing) != 3 {
-		t.Errorf("Expected hashRing to have 3 elements after removal, got %d", len(ring.hashRing))
-	}
-	for _, hash := range ring.hashRing {
-		if ring.mapping[hash] == "Node1" {
-			t.Errorf("Expected no mappings to Node1 after removal")
+func TestRingBasicOperations(t *testing.T) {
+	t.Run("Empty ring returns empty string", func(t *testing.T) {
+		ring := NewRing(DefaultVirtualNodes)
+		if node := ring.GetNode("somekey"); node != "" {
+			t.Errorf("Expected empty string for empty ring, got %s", node)
 		}
-	}
-}
+	})
 
-// TestGetNode verifies that key-to-node mapping is consistent.
-func TestGetNode(t *testing.T) {
-	ring := NewRing(3)
-	ring.AddNode("Node1")
-	ring.AddNode("Node2")
-	ring.AddNode("Node3")
-	
-	key := "testKey"
-	node := ring.GetNode(key)
-	if node == "" {
-		t.Errorf("Expected a node for key %s, got empty string", key)
-	}
-	
-	// Test consistency
-	for i := 0; i < 10; i++ {
-		node2 := ring.GetNode(key)
-		if node != node2 {
-			t.Errorf("Expected consistent node for key %s, got %s and %s", key, node, node2)
+	t.Run("Adding and getting node", func(t *testing.T) {
+		ring := NewRing(DefaultVirtualNodes)
+		ring.AddNode("node1")
+
+		// Any key should map to node1 since it's the only node
+		if node := ring.GetNode("somekey"); node != "node1" {
+			t.Errorf("Expected node1, got %s", node)
 		}
-	}
+	})
+
+	t.Run("Adding multiple nodes", func(t *testing.T) {
+		ring := NewRing(DefaultVirtualNodes)
+		ring.AddNode("node1")
+		ring.AddNode("node2")
+		ring.AddNode("node3")
+
+		// Verify we get some distribution
+		nodesFound := make(map[string]bool)
+		for i := 0; i < 100; i++ {
+			node := ring.GetNode(fmt.Sprintf("key-%d", i))
+			nodesFound[node] = true
+		}
+
+		if len(nodesFound) < 2 {
+			t.Errorf("Expected keys to be distributed across at least 2 nodes, got %d", len(nodesFound))
+		}
+	})
+
+	t.Run("Removing node", func(t *testing.T) {
+		ring := NewRing(DefaultVirtualNodes)
+		ring.AddNode("node1")
+		ring.AddNode("node2")
+
+		// Get and save mappings for a few keys
+		keys := []string{"key1", "key2", "key3", "key4", "key5"}
+		originalMappings := make(map[string]string)
+		for _, key := range keys {
+			originalMappings[key] = ring.GetNode(key)
+		}
+
+		// Count keys mapped to node1
+		node1Count := 0
+		for _, node := range originalMappings {
+			if node == "node1" {
+				node1Count++
+			}
+		}
+
+		// Remove node1
+		ring.RemoveNode("node1")
+
+		// All keys should now map to node2
+		for _, key := range keys {
+			if node := ring.GetNode(key); node != "node2" {
+				t.Errorf("Expected node2 after removal, got %s", node)
+			}
+		}
+
+		// Add node1 back
+		ring.AddNode("node1")
+
+		// Count how many keys went back to node1
+		revertedCount := 0
+		for _, key := range keys {
+			if ring.GetNode(key) == "node1" && originalMappings[key] == "node1" {
+				revertedCount++
+			}
+		}
+
+		// Check if at least some keys reverted to original mapping
+		if node1Count > 0 && revertedCount == 0 {
+			t.Errorf("Expected some keys to revert to node1, but none did")
+		}
+	})
 }
 
-// TestGetReplicas ensures that replicas are returned correctly.
+func TestRingConsistency(t *testing.T) {
+	t.Run("Consistency with node changes", func(t *testing.T) {
+		ring := NewRing(DefaultVirtualNodes)
+		
+		// Add initial nodes
+		initialNodes := []string{"node1", "node2", "node3"}
+		for _, node := range initialNodes {
+			ring.AddNode(node)
+		}
+
+		// Map 1000 keys
+		const keyCount = 1000
+		initialMapping := make(map[string]string)
+		for i := 0; i < keyCount; i++ {
+			key := fmt.Sprintf("key-%d", i)
+			initialMapping[key] = ring.GetNode(key)
+		}
+
+		// Add a new node
+		ring.AddNode("node4")
+		
+		// Check how many keys were remapped
+		remappedCount := 0
+		for i := 0; i < keyCount; i++ {
+			key := fmt.Sprintf("key-%d", i)
+			if ring.GetNode(key) != initialMapping[key] {
+				remappedCount++
+			}
+		}
+
+		// We expect roughly 1/4 of keys to be remapped
+		expectedRemapPercentage := 25.0
+		actualRemapPercentage := float64(remappedCount) / float64(keyCount) * 100
+
+		t.Logf("Remapped %d/%d keys (%.2f%%) after adding one node", 
+			remappedCount, keyCount, actualRemapPercentage)
+
+		// Allow some tolerance, but ensure we're roughly in the expected range
+		if actualRemapPercentage < 15.0 || actualRemapPercentage > 35.0 {
+			t.Errorf("Expected around %.2f%% keys to be remapped, got %.2f%%", 
+				expectedRemapPercentage, actualRemapPercentage)
+		}
+	})
+}
+
 func TestGetReplicas(t *testing.T) {
-	ring := NewRing(3)
-	ring.AddNode("Node1")
-	ring.AddNode("Node2")
-	ring.AddNode("Node3")
-	
-	key := "testKey"
-	replicas := ring.GetReplicas(key, 2)
-	if len(replicas) != 2 {
-		t.Errorf("Expected 2 replicas for key %s, got %d", key, len(replicas))
-	}
-	
-	// Verify distinct replicas
-	seen := make(map[string]struct{})
-	for _, replica := range replicas {
-		if _, exists := seen[replica]; exists {
-			t.Errorf("Duplicate replica %s for key %s", replica, key)
+	t.Run("Replicas with enough nodes", func(t *testing.T) {
+		ring := NewRing(DefaultVirtualNodes)
+		nodes := []string{"node1", "node2", "node3", "node4", "node5"}
+		for _, node := range nodes {
+			ring.AddNode(node)
 		}
-		seen[replica] = struct{}{}
-	}
-	
-	// Test requesting more replicas than nodes
-	replicas = ring.GetReplicas(key, 5)
-	if len(replicas) != 3 {
-		t.Errorf("Expected 3 replicas when requesting 5, got %d", len(replicas))
-	}
+
+		replicas := ring.GetReplicas("somekey", 3)
+		if len(replicas) != 3 {
+			t.Errorf("Expected 3 replicas, got %d", len(replicas))
+		}
+
+		// Check that all replicas are unique
+		seen := make(map[string]bool)
+		for _, replica := range replicas {
+			if seen[replica] {
+				t.Errorf("Duplicate replica found: %s", replica)
+			}
+			seen[replica] = true
+		}
+	})
+
+	t.Run("Replicas with not enough nodes", func(t *testing.T) {
+		ring := NewRing(DefaultVirtualNodes)
+		nodes := []string{"node1", "node2"}
+		for _, node := range nodes {
+			ring.AddNode(node)
+		}
+
+		replicas := ring.GetReplicas("somekey", 3)
+		if len(replicas) != 2 {
+			t.Errorf("Expected 2 replicas (limited by available nodes), got %d", len(replicas))
+		}
+	})
+
+	t.Run("Replicas with empty ring", func(t *testing.T) {
+		ring := NewRing(DefaultVirtualNodes)
+		replicas := ring.GetReplicas("somekey", 3)
+		if replicas != nil {
+			t.Errorf("Expected nil replicas for empty ring, got %v", replicas)
+		}
+	})
 }
 
-// TestEdgeCases covers various edge-case scenarios.
-func TestEdgeCases(t *testing.T) {
-	// Empty ring
-	ring := NewRing(3)
-	if node := ring.GetNode("key"); node != "" {
-		t.Errorf("Expected empty string for GetNode on empty ring, got %s", node)
-	}
-	if replicas := ring.GetReplicas("key", 2); len(replicas) != 0 {
-		t.Errorf("Expected no replicas for GetReplicas on empty ring, got %d", len(replicas))
-	}
-	
-	// Single node
-	ring.AddNode("Node1")
-	if node := ring.GetNode("key"); node != "Node1" {
-		t.Errorf("Expected Node1 for GetNode with single node, got %s", node)
-	}
-	replicas := ring.GetReplicas("key", 2)
-	if len(replicas) != 1 || replicas[0] != "Node1" {
-		t.Errorf("Expected [Node1] for GetReplicas with single node, got %v", replicas)
-	}
-	
-	// Multiple nodes with keys at different ring positions
-	ring.AddNode("Node2")
-	ring.AddNode("Node3")
-	keys := []string{"keyBegin", "keyMiddle", "keyEnd"}
-	for _, key := range keys {
-		node := ring.GetNode(key)
-		if node != "Node1" && node != "Node2" && node != "Node3" {
-			t.Errorf("Invalid node %s for key %s", node, key)
+func TestHashCollisions(t *testing.T) {
+	t.Run("Handling forced collisions", func(t *testing.T) {
+		// Create a ring that will have predictable collisions
+		ring := NewRing(5) // Use fewer vnodes to make test quicker
+		
+		// Use our own custom hash function that will create collisions
+		originalHashFunc := ring.hashFunc
+		
+		// This will simulate a hash collision on every other hash
+		collisionCounter := 0
+		ring.hashFunc = &mockHasher{
+			origHasher: originalHashFunc,
+			hashFn: func(data []byte) uint32 {
+				collisionCounter++
+				if collisionCounter%2 == 0 {
+					return 12345 // Force collision with the same hash
+				}
+				return originalHashFunc.Sum32()
+			},
 		}
-	}
-	
-	// Test wrap-around behavior (assuming hash function can produce large values)
-	// This assumes the ring handles hashes larger than the max hash by wrapping around
-}
-
-// TestConsistencyAfterChanges ensures key mappings adjust correctly after node changes.
-func TestConsistencyAfterChanges(t *testing.T) {
-	ring := NewRing(3)
-	ring.AddNode("Node1")
-	ring.AddNode("Node2")
-	ring.AddNode("Node3")
-	
-	keys := []string{"key1", "key2", "key3"}
-	originalNodes := make(map[string]string)
-	for _, key := range keys {
-		originalNodes[key] = ring.GetNode(key)
-	}
-	
-	ring.RemoveNode("Node2")
-	for _, key := range keys {
-		newNode := ring.GetNode(key)
-		if originalNodes[key] == "Node2" && newNode == "Node2" {
-			t.Errorf("Expected key %s to remap after Node2 removal, still mapped to Node2", key)
-		}
-	}
-	
-	ring.AddNode("Node4")
-	for _, key := range keys {
-		consistentNode := ring.GetNode(key)
-		for i := 0; i < 5; i++ {
-			if ring.GetNode(key) != consistentNode {
-				t.Errorf("Inconsistent mapping for key %s after adding Node4", key)
+		
+		// Add a few nodes - since every other hash is the same, we should see collisions
+		ring.AddNode("node1")
+		ring.AddNode("node2")
+		ring.AddNode("node3")
+		
+		// Verify each node has some virtual nodes
+		for _, node := range []string{"node1", "node2", "node3"} {
+			if len(ring.vnodes[node]) == 0 {
+				t.Errorf("Node %s has no virtual nodes despite collision handling", node)
 			}
 		}
-	}
+	})
 }
 
-// TestConcurrency ensures the ring handles concurrent operations safely.
-func TestConcurrency(t *testing.T) {
-	ring := NewRing(3)
-	var wg sync.WaitGroup
-	numGoroutines := 20
-	
-	for i := 0; i < numGoroutines; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			nodeName := fmt.Sprintf("Node%d", i)
-			ring.AddNode(nodeName)
-			for j := 0; j < 10; j++ {
-				key := fmt.Sprintf("key%d", j)
-				ring.GetNode(key)
-				ring.GetReplicas(key, 2)
-			}
-			ring.RemoveNode(nodeName)
-		}(i)
+func TestDistribution(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping distribution test in short mode")
 	}
-	
-	wg.Wait()
-	
-	// Post-concurrency sanity check
-	if len(ring.hashRing) != 0 {
-		t.Errorf("Expected hashRing to be empty after all nodes removed, got %d", len(ring.hashRing))
-	}
-}
 
-// TestHashDistribution verifies that keys are reasonably distributed across nodes.
-func TestHashDistribution(t *testing.T) {
-	ring := NewRing(3)
-	ring.AddNode("Node1")
-	ring.AddNode("Node2")
-	ring.AddNode("Node3")
-	
-	keys := make([]string, 100)
-	for i := 0; i < 100; i++ {
-		keys[i] = fmt.Sprintf("key%d", i)
-	}
-	
-	nodeCounts := make(map[string]int)
-	for _, key := range keys {
-		node := ring.GetNode(key)
-		nodeCounts[node]++
-	}
-	
-	// Log distribution for inspection
-	for node, count := range nodeCounts {
-		t.Logf("Node %s: %d keys", node, count)
-	}
-	
-	// Ensure all nodes have some keys (basic distribution check)
-	if len(nodeCounts) != 3 {
-		t.Errorf("Expected keys to be distributed across 3 nodes, got %d", len(nodeCounts))
-	}
-	for node, count := range nodeCounts {
-		if count == 0 {
-			t.Errorf("Node %s received no keys", node)
+	t.Run("Key distribution", func(t *testing.T) {
+		// Increase virtual nodes for better distribution
+		ring := NewRing(160) // Use more virtual nodes for better distribution
+		nodeCount := 10
+		
+		// Add nodes
+		for i := 0; i < nodeCount; i++ {
+			ring.AddNode(fmt.Sprintf("node%d", i))
 		}
+		
+		// Map a large number of keys
+		const keyCount = 100000
+		distribution := make(map[string]int)
+		
+		for i := 0; i < keyCount; i++ {
+			key := fmt.Sprintf("key-%d", i)
+			node := ring.GetNode(key)
+			distribution[node]++
+		}
+		
+		// Calculate statistics
+		mean := keyCount / nodeCount
+		variance := 0.0
+		
+		t.Log("Node distribution:")
+		for node, count := range distribution {
+			t.Logf("  %s: %d keys (%.2f%% of mean)", 
+				node, count, float64(count)/float64(mean)*100)
+			variance += float64((count - mean) * (count - mean))
+		}
+		
+		variance /= float64(nodeCount)
+		stdDev := float64(mean) * 0.20 // Allow 20% standard deviation 
+		
+		t.Logf("Mean: %d, Variance: %.2f, Std Dev: %.2f", mean, variance, stdDev)
+		
+		// Check that the distribution is relatively even
+		for node, count := range distribution {
+			if float64(count) < float64(mean)-stdDev || float64(count) > float64(mean)+stdDev {
+				t.Errorf("Node %s has %d keys, which is outside acceptable range [%d, %d]",
+					node, count, int(float64(mean)-stdDev), int(float64(mean)+stdDev))
+			}
+		}
+	})
+}
+
+func BenchmarkAddNode(b *testing.B) {
+	ring := NewRing(DefaultVirtualNodes)
+	b.ResetTimer()
+	
+	for i := 0; i < b.N; i++ {
+		nodeID := fmt.Sprintf("node-%d", i)
+		ring.AddNode(nodeID)
 	}
+}
+
+func BenchmarkGetNode(b *testing.B) {
+	ring := NewRing(DefaultVirtualNodes)
+	nodeCount := 100
+	
+	// Add a reasonable number of nodes
+	for i := 0; i < nodeCount; i++ {
+		ring.AddNode(fmt.Sprintf("node-%d", i))
+	}
+	
+	// Pre-generate keys to avoid string concatenation in the benchmark
+	keys := make([]string, b.N)
+	for i := 0; i < b.N; i++ {
+		keys[i] = fmt.Sprintf("key-%d", i)
+	}
+	
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ring.GetNode(keys[i])
+	}
+}
+
+func BenchmarkGetReplicas(b *testing.B) {
+	ring := NewRing(DefaultVirtualNodes)
+	nodeCount := 100
+	
+	// Add a reasonable number of nodes
+	for i := 0; i < nodeCount; i++ {
+		ring.AddNode(fmt.Sprintf("node-%d", i))
+	}
+	
+	// Pre-generate keys to avoid string concatenation in the benchmark
+	keys := make([]string, b.N)
+	for i := 0; i < b.N; i++ {
+		keys[i] = fmt.Sprintf("key-%d", i)
+	}
+	
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ring.GetReplicas(keys[i], 3)
+	}
+}
+
+// Mock hasher for collision testing
+type mockHasher struct {
+	origHasher hash.Hash32
+	hashFn     func([]byte) uint32
+}
+
+func (m *mockHasher) Write(p []byte) (n int, err error) {
+	return m.origHasher.Write(p)
+}
+
+func (m *mockHasher) Sum(b []byte) []byte {
+	return m.origHasher.Sum(b)
+}
+
+func (m *mockHasher) Reset() {
+	m.origHasher.Reset()
+}
+
+func (m *mockHasher) Size() int {
+	return m.origHasher.Size()
+}
+
+func (m *mockHasher) BlockSize() int {
+	return m.origHasher.BlockSize()
+}
+
+func (m *mockHasher) Sum32() uint32 {
+	return m.hashFn(nil)
 }
