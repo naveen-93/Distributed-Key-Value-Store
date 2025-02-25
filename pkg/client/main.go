@@ -18,10 +18,13 @@ import (
 )
 
 var (
-	ErrValidation     = errors.New("validation error")
-	ErrQuorumNotMet   = errors.New("failed to achieve quorum")
-	ErrNoNodes        = errors.New("no available nodes")
-	ErrConnectionFail = errors.New("failed to connect to servers")
+	ErrValidation       = errors.New("validation error")
+	ErrQuorumNotMet     = errors.New("failed to achieve quorum")
+	ErrNoNodes          = errors.New("no available nodes")
+	ErrConnectionFail   = errors.New("failed to connect to servers")
+	ErrTimeout          = errors.New("operation timed out")
+	ErrRingUpdate       = errors.New("ring update failed")
+	ErrNoNodesAvailable = errors.New("no nodes available")
 )
 
 const (
@@ -31,6 +34,9 @@ const (
 	maxKeyLength       = 128
 	maxValueLength     = 2048
 )
+
+// Add this to the top of main.go
+type getReplicaNodesFunc func(string) []string
 
 // Client represents a KVStore client
 type Client struct {
@@ -61,6 +67,8 @@ type Client struct {
 	nodeStates  map[string]*nodeState
 	nodeStateMu sync.RWMutex
 	maxFailures int
+
+	getReplicaNodesFn getReplicaNodesFunc
 }
 
 // Value with timestamp for conflict resolution
@@ -78,37 +86,129 @@ type nodeState struct {
 
 func NewClient(servers []string) (*Client, error) {
 	if len(servers) == 0 {
-		return nil, fmt.Errorf("%w: at least one server required", ErrValidation)
+		return nil, fmt.Errorf("no servers provided")
 	}
 
 	client := &Client{
-		servers:            servers,
-		connections:        make(map[string]*grpc.ClientConn),
-		clients:            make(map[string]pb.KVStoreClient),
-		dialTimeout:        5 * time.Second,
-		requestTimeout:     2 * time.Second,
-		maxRetries:         3,
-		readQuorum:         defaultReadQuorum,
-		writeQuorum:        defaultWriteQuorum,
-		ringUpdateInterval: 30 * time.Second,
-		nodeStates:         make(map[string]*nodeState),
-		maxFailures:        3,
+		servers:        servers,
+		clients:        make(map[string]pb.KVStoreClient),
+		connections:    make(map[string]*grpc.ClientConn),
+		dialTimeout:    5 * time.Second,
+		requestTimeout: 2 * time.Second,
+		maxRetries:     3,
+		readQuorum:     2,
+		writeQuorum:    2,
+		nodeStates:     make(map[string]*nodeState),
+		ring:           consistenthash.NewRing(10),
 	}
 
 	if err := client.initConnections(); err != nil {
-		return nil, fmt.Errorf("connection initialization failed: %w", err)
+		return nil, fmt.Errorf("failed to initialize connections: %w", err)
 	}
 
 	if err := client.updateRing(); err != nil {
-		return nil, fmt.Errorf("initial ring update failed: %w", err)
+		return nil, fmt.Errorf("failed to initialize ring: %w", err)
 	}
 
-	client.startRingUpdates()
 	return client, nil
 }
 
 // Get retrieves a value with improved validation and error handling
 func (c *Client) Get(key string) (string, bool, error) {
+	if err := validateKey(key); err != nil {
+		return "", false, fmt.Errorf("%w: %v", ErrValidation, err)
+	}
+
+	var (
+		wg            sync.WaitGroup
+		mu            sync.Mutex
+		values        []valueWithTimestamp
+		errors        []error
+		successCount  int
+		notFoundCount int
+	)
+
+	nodes := c.getReplicaNodes(key)
+	if len(nodes) == 0 {
+		return "", false, ErrNoNodesAvailable
+	}
+
+	// Track responses from each node
+	responses := make(map[string]valueWithTimestamp)
+
+	for _, node := range nodes {
+		wg.Add(1)
+		go func(node string) {
+			defer wg.Done()
+
+			value, exists, timestamp, err := c.getFromNode(node, key)
+			mu.Lock()
+			defer mu.Unlock()
+
+			if err != nil {
+				c.recordNodeFailure(node)
+				errors = append(errors, fmt.Errorf("node %s: %w", node, err))
+				return
+			}
+
+			c.recordNodeSuccess(node)
+			successCount++
+
+			if exists {
+				val := valueWithTimestamp{
+					value:     value,
+					timestamp: timestamp,
+					nodeAddr:  node,
+					exists:    exists,
+				}
+				values = append(values, val)
+				responses[node] = val
+			} else {
+				notFoundCount++
+			}
+		}(node)
+	}
+
+	wg.Wait()
+
+	if successCount < c.readQuorum {
+		return "", false, fmt.Errorf("%w: got %d successes, need %d. Errors: %v",
+			ErrQuorumNotMet, successCount, c.readQuorum, errors)
+	}
+
+	if notFoundCount >= c.readQuorum {
+		return "", false, nil
+	}
+
+	if len(values) == 0 {
+		return "", false, nil
+	}
+
+	latest := c.resolveConflicts(values)
+
+	// Only perform read repair if we have inconsistent values
+	if len(responses) > 1 {
+		inconsistent := false
+		latestValue := latest.value
+		latestTimestamp := latest.timestamp
+
+		for _, resp := range responses {
+			if resp.value != latestValue || resp.timestamp != latestTimestamp {
+				inconsistent = true
+				break
+			}
+		}
+
+		if inconsistent {
+			go c.performReadRepair(key, latest, values)
+		}
+	}
+
+	return latest.value, latest.exists, nil
+}
+
+// GetWithContext is like Get but accepts a context for cancellation
+func (c *Client) GetWithContext(ctx context.Context, key string) (string, bool, error) {
 	if err := validateKey(key); err != nil {
 		return "", false, fmt.Errorf("%w: %v", ErrValidation, err)
 	}
@@ -123,9 +223,6 @@ func (c *Client) Get(key string) (string, bool, error) {
 		ClientId:  c.clientID,
 		RequestId: c.nextRequestID(),
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), c.requestTimeout)
-	defer cancel()
 
 	responses := make(chan valueWithTimestamp, len(nodes))
 	errs := make(chan error, len(nodes))
@@ -182,7 +279,7 @@ func (c *Client) Get(key string) (string, bool, error) {
 }
 
 // Put sets a value with improved validation and error handling
-func (c *Client) Put(key, value string) (string, bool, error) {
+func (c *Client) Put(key string, value string) (string, bool, error) {
 	if err := validateKey(key); err != nil {
 		return "", false, fmt.Errorf("%w: %v", ErrValidation, err)
 	}
@@ -192,81 +289,52 @@ func (c *Client) Put(key, value string) (string, bool, error) {
 
 	nodes := c.getReplicaNodes(key)
 	if len(nodes) == 0 {
-		return "", false, ErrNoNodes
+		return "", false, ErrNoNodesAvailable
 	}
 
-	req := &pb.PutRequest{
-		Key:       key,
-		Value:     value,
-		ClientId:  c.clientID,
-		RequestId: c.nextRequestID(),
-		Timestamp: uint64(time.Now().UnixNano()),
-	}
+	timestamp := time.Now().UnixNano()
 
-	type putResult struct {
-		oldValue    string
-		hadOldValue bool
-		err         error
-	}
+	var (
+		wg           sync.WaitGroup
+		mu           sync.Mutex
+		oldValues    []string
+		errors       []error
+		successCount int
+	)
 
-	results := make(chan putResult, len(nodes))
-	var wg sync.WaitGroup
-
-	ctx, cancel := context.WithTimeout(context.Background(), c.requestTimeout)
-	defer cancel()
-
-	// Send PUT to all replicas concurrently
 	for _, node := range nodes {
 		wg.Add(1)
-		go func(addr string) {
+		go func(node string) {
 			defer wg.Done()
-			resp, err := c.sendPutToReplica(ctx, addr, req)
+
+			oldVal, hadOld, err := c.putToNode(node, key, value, timestamp)
+			mu.Lock()
+			defer mu.Unlock()
+
 			if err != nil {
-				results <- putResult{err: err}
+				c.recordNodeFailure(node)
+				errors = append(errors, fmt.Errorf("node %s: %w", node, err))
 				return
 			}
-			results <- putResult{
-				oldValue:    resp.OldValue,
-				hadOldValue: resp.HadOldValue,
+
+			c.recordNodeSuccess(node)
+			if hadOld {
+				oldValues = append(oldValues, oldVal)
 			}
+			successCount++
 		}(node)
 	}
 
-	// Wait for all goroutines to complete
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
+	wg.Wait()
 
-	// Process results
-	var successes int
-	var oldValues []valueWithTimestamp
-	var errors []error
-
-	for result := range results {
-		if result.err != nil {
-			errors = append(errors, result.err)
-			continue
-		}
-		successes++
-		if result.hadOldValue {
-			oldValues = append(oldValues, valueWithTimestamp{
-				value:  result.oldValue,
-				exists: true,
-			})
-		}
-	}
-
-	if successes < c.writeQuorum {
+	if successCount < c.writeQuorum {
 		return "", false, fmt.Errorf("%w: got %d successes, need %d. Errors: %v",
-			ErrQuorumNotMet, successes, c.writeQuorum, errors)
+			ErrQuorumNotMet, successCount, c.writeQuorum, errors)
 	}
 
 	if len(oldValues) > 0 {
-		latest := c.resolveConflicts(oldValues)
-		return latest.value, true, nil
+		return oldValues[0], true, nil
 	}
-
 	return "", false, nil
 }
 
@@ -370,6 +438,10 @@ func isUUEncoded(s string) bool {
 }
 
 func (c *Client) getReplicaNodes(key string) []string {
+	if c.getReplicaNodesFn != nil {
+		return c.getReplicaNodesFn(key)
+	}
+
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -392,6 +464,7 @@ func (c *Client) getReplicaNodes(key string) []string {
 
 	return nodes
 }
+
 func (c *Client) resolveConflicts(values []valueWithTimestamp) valueWithTimestamp {
 	if len(values) == 0 {
 		return valueWithTimestamp{}
@@ -409,30 +482,16 @@ func (c *Client) resolveConflicts(values []valueWithTimestamp) valueWithTimestam
 }
 
 func (c *Client) performReadRepair(key string, latest valueWithTimestamp, values []valueWithTimestamp) {
+	// Only repair if we have inconsistencies
 	for _, val := range values {
-		if val.timestamp < latest.timestamp {
-			// Create context for each repair operation
-			ctx, cancel := context.WithTimeout(context.Background(), c.requestTimeout)
-
-			req := &pb.PutRequest{
-				Key:       key,
-				Value:     latest.value,
-				ClientId:  c.clientID,
-				RequestId: c.nextRequestID(),
-				Timestamp: latest.timestamp,
-			}
-
+		if val.value != latest.value || val.timestamp != latest.timestamp {
+			node := val.nodeAddr
 			err := c.retryWithBackoff(func() error {
-				client := c.clients[val.nodeAddr]
-				_, err := client.Put(ctx, req)
+				_, _, err := c.putToNode(node, key, latest.value, int64(latest.timestamp))
 				return err
 			})
-
-			cancel() // Cancel after retry attempts
-
 			if err != nil {
-				log.Printf("Read repair failed for %s on %s after retries: %v",
-					key, val.nodeAddr, err)
+				log.Printf("Read repair failed for node %s: %v", node, err)
 			}
 		}
 	}
@@ -478,22 +537,24 @@ func (c *Client) recordNodeSuccess(addr string) {
 	c.nodeStateMu.Lock()
 	defer c.nodeStateMu.Unlock()
 
-	if state, exists := c.nodeStates[addr]; exists {
-		state.lastSuccess = time.Now()
-		state.failures = 0
+	state, exists := c.nodeStates[addr]
+	if !exists {
+		state = &nodeState{}
+		c.nodeStates[addr] = state
 	}
+	state.lastSuccess = time.Now()
+	state.failures = 0
 }
 
 func (c *Client) recordNodeFailure(addr string) bool {
 	c.nodeStateMu.Lock()
 	defer c.nodeStateMu.Unlock()
 
-	state := c.nodeStates[addr]
-	if state == nil {
+	state, exists := c.nodeStates[addr]
+	if !exists {
 		state = &nodeState{}
 		c.nodeStates[addr] = state
 	}
-
 	state.failures++
 	return state.failures >= c.maxFailures
 }
@@ -562,4 +623,83 @@ func (c *Client) startRingUpdates() {
 			}
 		}
 	}()
+}
+
+// StartHealthChecks periodically checks node health
+func (c *Client) StartHealthChecks(interval time.Duration) {
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			c.checkNodeHealth()
+		}
+	}()
+}
+
+func (c *Client) checkNodeHealth() {
+	for _, addr := range c.servers {
+		if client, ok := c.clients[addr]; ok {
+			ctx, cancel := context.WithTimeout(context.Background(), c.dialTimeout)
+			_, err := client.GetRingState(ctx, &pb.RingStateRequest{})
+			cancel()
+
+			if err != nil {
+				if c.recordNodeFailure(addr) {
+					log.Printf("Node %s marked as dead after %d failures", addr, c.maxFailures)
+				}
+			} else {
+				c.recordNodeSuccess(addr)
+			}
+		}
+	}
+}
+
+// Add this method to the Client struct
+func (c *Client) getFromNode(node string, key string) (string, bool, uint64, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), c.requestTimeout)
+	defer cancel()
+
+	client, ok := c.clients[node]
+	if !ok {
+		return "", false, 0, fmt.Errorf("no connection to node %s", node)
+	}
+
+	req := &pb.GetRequest{
+		Key:       key,
+		ClientId:  c.clientID,
+		RequestId: c.nextRequestID(),
+	}
+
+	resp, err := client.Get(ctx, req)
+	if err != nil {
+		return "", false, 0, err
+	}
+
+	return resp.Value, resp.Exists, resp.Timestamp, nil
+}
+
+func (c *Client) putToNode(node string, key string, value string, timestamp int64) (string, bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), c.requestTimeout)
+	defer cancel()
+
+	client, ok := c.clients[node]
+	if !ok {
+		return "", false, fmt.Errorf("no connection to node %s", node)
+	}
+
+	req := &pb.PutRequest{
+		Key:       key,
+		Value:     value,
+		ClientId:  c.clientID,
+		RequestId: c.nextRequestID(),
+		Timestamp: uint64(timestamp),
+	}
+
+	resp, err := client.Put(ctx, req)
+	if err != nil {
+		return "", false, err
+	}
+
+	return resp.OldValue, resp.HadOldValue, nil
 }
