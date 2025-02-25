@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	DefaultVirtualNodes = 10
+	DefaultVirtualNodes   = 10
 	MaxAttemptsMultiplier = 100 // Increased multiplier for more collision attempts
 )
 
@@ -79,7 +79,7 @@ func (r *Ring) AddNode(node string) {
 	}
 
 	if len(hashes) < r.vnodeCount {
-		fmt.Printf("Warning: Node %s could only add %d/%d virtual nodes due to excessive collisions\n", 
+		fmt.Printf("Warning: Node %s could only add %d/%d virtual nodes due to excessive collisions\n",
 			node, len(hashes), r.vnodeCount)
 	}
 
@@ -214,4 +214,10 @@ func (r *Ring) GetReplicas(key string, count int) []string {
 	}
 
 	return replicas
+}
+
+func HashString(s string) uint32 {
+	h := murmur3.New32()
+	h.Write([]byte(s))
+	return h.Sum32()
 }

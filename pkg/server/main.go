@@ -18,51 +18,97 @@ import (
 	"Distributed-Key-Value-Store/internal/node"
 	pb "Distributed-Key-Value-Store/kvstore/proto"
 	"Distributed-Key-Value-Store/pkg/consistenthash"
+
+	"github.com/google/uuid"
 )
 
 type server struct {
 	pb.UnimplementedKVStoreServer
 	pb.UnimplementedNodeInternalServer
 
-	nodeID uint32
+	nodeID string
 	store  *node.Node
 	ring   *consistenthash.Ring
 	mu     sync.RWMutex
 
 	// Node management
-	peers   map[uint32]string
-	clients map[uint32]pb.NodeInternalClient
+	peers   map[string]string
+	clients map[string]pb.NodeInternalClient
 
 	// Configuration
 	syncInterval      time.Duration
 	heartbeatInterval time.Duration
 	replicationFactor int
+
+	stopChan chan struct{}
 }
 
-func NewServer(nodeID uint32) *server {
-	s := &server{
-		nodeID:            nodeID,
-		store:             node.NewNode(nodeID),
-		ring:              consistenthash.NewRing(consistenthash.DefaultVirtualNodes),
-		peers:             make(map[uint32]string),
-		clients:           make(map[uint32]pb.NodeInternalClient),
-		syncInterval:      5 * time.Minute,
-		heartbeatInterval: time.Second,
-		replicationFactor: 3,
+type ServerConfig struct {
+	syncInterval      time.Duration
+	heartbeatInterval time.Duration
+	replicationFactor int
+	virtualNodes      int
+}
+
+func NewServer(nodeID string, config *ServerConfig) (*server, error) {
+	// Use provided config or defaults
+	if config == nil {
+		config = &ServerConfig{
+			syncInterval:      5 * time.Minute,
+			heartbeatInterval: time.Second,
+			replicationFactor: 3,
+			virtualNodes:      consistenthash.DefaultVirtualNodes,
+		}
 	}
 
-	// Add self to ring
-	s.ring.AddNode(fmt.Sprintf("node-%d", nodeID))
-	return s
+	// Validate or generate UUID
+	var nodeUUID uuid.UUID
+	var err error
+
+	if nodeID == "" {
+		// Generate new UUID if none provided
+		nodeUUID = uuid.New()
+	} else {
+		// Parse provided ID as UUID
+		nodeUUID, err = uuid.Parse(nodeID)
+		if err != nil {
+			return nil, fmt.Errorf("invalid node ID format, must be UUID: %v", err)
+		}
+	}
+
+	// Use UUID string as node identifier
+	nodeIDString := nodeUUID.String()
+
+	s := &server{
+		nodeID:            nodeIDString,
+		store:             node.NewNode(uint32(consistenthash.HashString(nodeIDString))),
+		ring:              consistenthash.NewRing(config.virtualNodes),
+		peers:             make(map[string]string),
+		clients:           make(map[string]pb.NodeInternalClient),
+		syncInterval:      config.syncInterval,
+		heartbeatInterval: config.heartbeatInterval,
+		replicationFactor: config.replicationFactor,
+		stopChan:          make(chan struct{}),
+	}
+
+	// Add self to ring using full UUID
+	s.ring.AddNode(fmt.Sprintf("node-%s", nodeIDString))
+	s.startHeartbeat()
+	return s, nil
 }
 
-func (s *server) addPeer(peerID uint32, addr string) error {
+func (s *server) addPeer(peerID string, addr string) error {
+	// Validate peer UUID
+	if _, err := uuid.Parse(peerID); err != nil {
+		return fmt.Errorf("invalid peer UUID: %v", err)
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	// Add to peer list and ring
 	s.peers[peerID] = addr
-	s.ring.AddNode(fmt.Sprintf("node-%d", peerID))
+	s.ring.AddNode(fmt.Sprintf("node-%s", peerID))
 
 	// Establish gRPC connection
 	conn, err := grpc.Dial(addr, grpc.WithInsecure())
@@ -80,69 +126,28 @@ func (s *server) addPeer(peerID uint32, addr string) error {
 
 // Get implements the KVStore Get RPC method
 func (s *server) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, error) {
-	// Get local value
 	value, timestamp, exists := s.store.Get(req.Key)
-	if !exists {
-		return &pb.GetResponse{
-			Exists: false,
-		}, nil
-	}
-
-	// Query replicas for potentially newer values
-	replicaValues := make([]struct {
-		value     string
-		timestamp uint64
-	}, 0)
-
-	// Add local value
-	replicaValues = append(replicaValues, struct {
-		value     string
-		timestamp uint64
-	}{string(value), timestamp})
-
-	// Find the latest value among replicas
-	var latest struct {
-		value     string
-		timestamp uint64
-	}
-
-	for _, rv := range replicaValues {
-		if rv.timestamp > latest.timestamp {
-			latest.value = rv.value
-			latest.timestamp = rv.timestamp
-		}
-	}
-
-	// Perform read repair if needed
-	if latest.timestamp > timestamp {
-		go s.store.Store(req.Key, latest.value, latest.timestamp)
-	}
-
 	return &pb.GetResponse{
-		Value:     latest.value,
-		Exists:    true,
-		Timestamp: latest.timestamp,
+		Value:     value,
+		Timestamp: timestamp,
+		Exists:    exists,
 	}, nil
 }
 
 // Put implements the KVStore Put RPC method
 func (s *server) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
-	// Store value locally first
+	// Call the appropriate method on the store
 	err := s.store.Store(req.Key, req.Value, req.Timestamp)
 	if err != nil {
-		return nil, fmt.Errorf("failed to store value: %v", err)
+		return nil, err
 	}
 
-	// Get the old value for the response
-	oldValue, oldTimestamp, hadOld := s.store.Get(req.Key)
-
-	// Replicate to other nodes asynchronously
-	go s.replicateToNodes(req.Key, req.Value, req.Timestamp)
+	// Get old value for response
+	oldValue, _, hadOldValue := s.store.Get(req.Key)
 
 	return &pb.PutResponse{
-		OldValue:     oldValue,
-		HadOldValue:  hadOld,
-		OldTimestamp: oldTimestamp,
+		OldValue:    string(oldValue),
+		HadOldValue: hadOldValue,
 	}, nil
 }
 
@@ -174,10 +179,10 @@ func (s *server) GetRingState(ctx context.Context, req *pb.RingStateRequest) (*p
 
 	nodes := make(map[string]bool)
 	for id, _ := range s.peers {
-		nodes[fmt.Sprintf("node-%d", id)] = true
+		nodes[fmt.Sprintf("node-%s", id)] = true
 	}
 	// Add self
-	nodes[fmt.Sprintf("node-%d", s.nodeID)] = true
+	nodes[fmt.Sprintf("node-%s", s.nodeID)] = true
 
 	return &pb.RingStateResponse{
 		Version:   uint64(time.Now().UnixNano()),
@@ -191,26 +196,40 @@ func (s *server) replicateToNodes(key, value string, timestamp uint64) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	// Get replica nodes from ring
+	hash := s.ring.HashKey(key)
+	replicasSent := 1 // Count self as first replica
+	currentHash := hash
+
 	req := &pb.ReplicateRequest{
 		Key:       key,
 		Value:     value,
 		Timestamp: timestamp,
 	}
 
-	for nodeID, client := range s.clients {
-		if nodeID == s.nodeID {
-			continue // Skip self
+	// Send to next nodes in ring until we hit replicationFactor
+	for replicasSent < s.replicationFactor {
+		nextNodeID := s.ring.GetNextNode(currentHash)
+		if nextNodeID == "" || nextNodeID == fmt.Sprintf("node-%s", s.nodeID) {
+			break // No more nodes available or wrapped around to self
 		}
 
-		go func(c pb.NodeInternalClient) {
-			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-			defer cancel()
+		// Extract UUID from node ID format "node-{uuid}"
+		peerID := strings.TrimPrefix(nextNodeID, "node-")
+		if client, ok := s.clients[peerID]; ok {
+			go func(c pb.NodeInternalClient) {
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				defer cancel()
 
-			_, err := c.Replicate(ctx, req)
-			if err != nil {
-				log.Printf("Failed to replicate to node: %v", err)
-			}
-		}(client)
+				_, err := c.Replicate(ctx, req)
+				if err != nil {
+					log.Printf("Failed to replicate to node %s: %v", nextNodeID, err)
+				}
+			}(client)
+			replicasSent++
+		}
+
+		currentHash = s.ring.HashKey(nextNodeID)
 	}
 }
 
@@ -225,7 +244,7 @@ func (s *server) rebalanceRing() {
 		newNodeID := s.ring.GetNode(fmt.Sprintf("%d", hash))
 
 		// If the new node is different from the current node, move the key
-		if newNodeID != fmt.Sprintf("node-%d", s.nodeID) {
+		if newNodeID != fmt.Sprintf("node-%s", s.nodeID) {
 			value, timestamp, exists := s.store.Get(key)
 			if exists {
 				// Replicate the key to the new node
@@ -235,7 +254,7 @@ func (s *server) rebalanceRing() {
 					Timestamp: uint64(timestamp),
 				}
 
-				if client, ok := s.clients[uint32(s.ring.HashKey(newNodeID))]; ok {
+				if client, ok := s.clients[newNodeID]; ok {
 					ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 					defer cancel()
 
@@ -249,30 +268,97 @@ func (s *server) rebalanceRing() {
 	}
 }
 
+func (s *server) startHeartbeat() {
+	ticker := time.NewTicker(s.heartbeatInterval)
+	go func() {
+		for {
+			select {
+			case <-ticker.C:
+				s.checkPeers()
+			case <-s.stopChan:
+				ticker.Stop()
+				return
+			}
+		}
+	}()
+}
+
+func (s *server) checkPeers() {
+	s.mu.RLock()
+	peers := make(map[string]pb.NodeInternalClient)
+	for id, client := range s.clients {
+		peers[id] = client
+	}
+	s.mu.RUnlock()
+
+	for peerID, client := range peers {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		_, err := client.Heartbeat(ctx, &pb.Ping{
+			NodeId:    uint32(consistenthash.HashString(s.nodeID)),
+			Timestamp: uint64(time.Now().UnixNano()),
+		})
+		cancel()
+
+		if err != nil {
+			s.handlePeerFailure(peerID)
+		}
+	}
+}
+
+func (s *server) handlePeerFailure(peerID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	delete(s.peers, peerID)
+	delete(s.clients, peerID)
+	s.ring.RemoveNode(fmt.Sprintf("node-%s", peerID))
+	s.rebalanceRing()
+}
+
 func main() {
-	// Parse flags
-	nodeID := flag.Uint("id", 0, "Node ID (required)")
+	nodeID := flag.String("id", "", "Node ID (optional, must be valid UUID if provided)")
 	addr := flag.String("addr", ":50051", "Address to listen on")
-	peerList := flag.String("peers", "", "Comma-separated list of peer addresses")
+	peerList := flag.String("peers", "", "Comma-separated list of peer addresses in format 'uuid@address'")
+	syncInterval := flag.Duration("sync-interval", 5*time.Minute, "Anti-entropy sync interval")
+	heartbeatInterval := flag.Duration("heartbeat-interval", time.Second, "Heartbeat check interval")
+	replicationFactor := flag.Int("replication-factor", 3, "Number of replicas per key")
+	virtualNodes := flag.Int("virtual-nodes", consistenthash.DefaultVirtualNodes, "Number of virtual nodes per physical node")
 	flag.Parse()
 
-	if *nodeID == 0 {
-		log.Fatal("Node ID is required")
+	config := &ServerConfig{
+		syncInterval:      *syncInterval,
+		heartbeatInterval: *heartbeatInterval,
+		replicationFactor: *replicationFactor,
+		virtualNodes:      *virtualNodes,
 	}
 
-	// Create server
-	srv := NewServer(uint32(*nodeID))
+	srv, err := NewServer(*nodeID, config)
+	if err != nil {
+		log.Fatalf("Failed to create server: %v", err)
+	}
 
-	// Add peers if provided
+	// Parse peers in format "uuid@address"
 	if *peerList != "" {
 		peers := strings.Split(*peerList, ",")
-		for i, addr := range peers {
-			peerID := uint32(i + 1)
-			if peerID == uint32(*nodeID) {
+		for _, peer := range peers {
+			parts := strings.Split(peer, "@")
+			if len(parts) != 2 {
+				log.Printf("Invalid peer format %s, expected 'uuid@address'", peer)
 				continue
 			}
+			peerID, addr := parts[0], parts[1]
+
+			// Validate peer UUID
+			if _, err := uuid.Parse(peerID); err != nil {
+				log.Printf("Invalid peer UUID %s: %v", peerID, err)
+				continue
+			}
+
+			if peerID == srv.nodeID {
+				continue // Skip self
+			}
 			if err := srv.addPeer(peerID, addr); err != nil {
-				log.Printf("Failed to add peer %d at %s: %v", peerID, addr, err)
+				log.Printf("Failed to add peer %s at %s: %v", peerID, addr, err)
 			}
 		}
 	}
@@ -289,7 +375,7 @@ func main() {
 
 	// Start server
 	go func() {
-		log.Printf("Node %d listening on %s", *nodeID, *addr)
+		log.Printf("Node %s listening on %s", *nodeID, *addr)
 		if err := grpcServer.Serve(lis); err != nil {
 			log.Fatalf("Failed to serve: %v", err)
 		}

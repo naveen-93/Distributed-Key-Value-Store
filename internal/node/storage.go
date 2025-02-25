@@ -1,3 +1,4 @@
+
 package node
 
 import (
@@ -164,6 +165,7 @@ type Node struct {
 type KeyValue struct {
 	Value       string
 	Timestamp   uint64
+	CreatedAt   int64
 	IsTombstone bool
 	TTL         uint64
 }
@@ -180,6 +182,7 @@ type WALEntry struct {
 	Key       string
 	Value     string // Empty for DELETE
 	Timestamp uint64
+	CreatedAt int64
 	Checksum  uint32
 	TTL       uint64
 }
@@ -190,6 +193,7 @@ func (e *WALEntry) computeChecksum() uint32 {
 	h.Write([]byte(e.Key))
 	h.Write([]byte(e.Value))
 	binary.Write(h, binary.BigEndian, e.Timestamp)
+	binary.Write(h, binary.BigEndian, e.CreatedAt)
 	return h.Sum32()
 }
 
@@ -199,45 +203,51 @@ func (e *WALEntry) validate() bool {
 
 func (e *WALEntry) encode() string {
 	e.Checksum = e.computeChecksum()
-	return fmt.Sprintf("%s %s %s %d %d %d\n",
-		e.Operation, e.Key, e.Value, e.Timestamp, e.Checksum, e.TTL)
+	return fmt.Sprintf("%s %s %s %d %d %d %d\n",
+		e.Operation, e.Key, e.Value, e.Timestamp, e.CreatedAt, e.Checksum, e.TTL)
 }
 
 func parseWALEntry(line string) (*WALEntry, error) {
-	parts := strings.Fields(line)
-	if len(parts) < 6 {
-		return nil, fmt.Errorf("malformed WAL entry: %s", line)
-	}
+    parts := strings.Fields(line)
+    if len(parts) < 7 { // Now expecting 7 parts
+        return nil, fmt.Errorf("malformed WAL entry: %s", line)
+    }
 
-	timestamp, err := strconv.ParseUint(parts[3], 10, 64)
-	if err != nil {
-		return nil, fmt.Errorf("invalid timestamp: %v", err)
-	}
+    timestamp, err := strconv.ParseUint(parts[3], 10, 64)
+    if err != nil {
+        return nil, fmt.Errorf("invalid timestamp: %v", err)
+    }
 
-	checksum, err := strconv.ParseUint(parts[4], 10, 32)
-	if err != nil {
-		return nil, fmt.Errorf("invalid checksum: %v", err)
-	}
+    createdAt, err := strconv.ParseInt(parts[4], 10, 64)
+    if err != nil {
+        return nil, fmt.Errorf("invalid createdAt: %v", err)
+    }
 
-	ttl, err := strconv.ParseUint(parts[5], 10, 64)
-	if err != nil {
-		return nil, fmt.Errorf("invalid TTL: %v", err)
-	}
+    checksum, err := strconv.ParseUint(parts[5], 10, 32)
+    if err != nil {
+        return nil, fmt.Errorf("invalid checksum: %v", err)
+    }
 
-	entry := &WALEntry{
-		Operation: parts[0],
-		Key:       parts[1],
-		Value:     parts[2],
-		Timestamp: timestamp,
-		Checksum:  uint32(checksum),
-		TTL:       ttl,
-	}
+    ttl, err := strconv.ParseUint(parts[6], 10, 64)
+    if err != nil {
+        return nil, fmt.Errorf("invalid TTL: %v", err)
+    }
 
-	if !entry.validate() {
-		return nil, fmt.Errorf("checksum mismatch")
-	}
+    entry := &WALEntry{
+        Operation: parts[0],
+        Key:       parts[1],
+        Value:     parts[2],
+        Timestamp: timestamp,
+        CreatedAt: createdAt,
+        Checksum:  uint32(checksum),
+        TTL:       ttl,
+    }
 
-	return entry, nil
+    if !entry.validate() {
+        return nil, fmt.Errorf("checksum mismatch")
+    }
+
+    return entry, nil
 }
 
 func NewNode(id uint32) *Node {
@@ -270,66 +280,67 @@ func (n *Node) generateTimestamp() uint64 {
 }
 
 func (n *Node) Store(key, value string, timestamp uint64, ttl ...uint64) error {
-	// Default TTL is 0 (no expiration)
-	defaultTTL := uint64(0)
-	if len(ttl) > 0 {
-		defaultTTL = ttl[0]
-	}
+    defaultTTL := uint64(0)
+    if len(ttl) > 0 {
+        defaultTTL = ttl[0]
+    }
 
-	entry := &WALEntry{
-		Operation: "PUT",
-		Key:       key,
-		Value:     value,
-		Timestamp: timestamp,
-		TTL:       defaultTTL,
-	}
+    entry := &WALEntry{
+        Operation: "PUT",
+        Key:       key,
+        Value:     value,
+        Timestamp: timestamp,
+        CreatedAt: timeNow().Unix(),
+        TTL:       defaultTTL,
+    }
 
-	// Write to WAL first
-	if err := n.walWriter.Write(entry); err != nil {
-		log.Printf("WAL write failed: %v", err)
-		return err // Do not update store if WAL fails
-	}
+    // Write to WAL first
+    if err := n.walWriter.Write(entry); err != nil {
+        log.Printf("WAL write failed: %v", err)
+        return err
+    }
 
-	// Update store only after successful WAL write
-	n.storeMu.Lock()
-	defer n.storeMu.Unlock()
-	existing, exists := n.store[key]
-	if !exists || timestamp > existing.Timestamp {
-		n.store[key] = &KeyValue{
-			Value:     value,
-			Timestamp: timestamp,
-			TTL:       defaultTTL,
-		}
-	}
-	return nil
+    // Update store only after successful WAL write
+    n.storeMu.Lock()
+    defer n.storeMu.Unlock()
+    existing, exists := n.store[key]
+    if !exists || timestamp > existing.Timestamp {
+        n.store[key] = &KeyValue{
+            Value:     value,
+            Timestamp: timestamp,
+            CreatedAt: timeNow().Unix(),
+            TTL:       defaultTTL,
+        }
+    }
+    return nil
 }
-
 func (n *Node) Delete(key string) error {
-	timestamp := n.generateTimestamp() // Assume this generates a timestamp
+    timestamp := n.generateTimestamp()
 
-	// Write tombstone to WAL first
-	err := n.walWriter.Write(&WALEntry{
-		Operation: "DELETE",
-		Key:       key,
-		Timestamp: timestamp,
-		TTL:       86400, // Example TTL for tombstone
-	})
-	if err != nil {
-		log.Printf("WAL write failed: %v", err)
-		return err // Do not update store if WAL fails
-	}
+    // Write tombstone to WAL first
+    entry := &WALEntry{
+        Operation: "DELETE",
+        Key:       key,
+        Timestamp: timestamp,
+        CreatedAt: timeNow().Unix(),
+        TTL:       86400, // Example TTL for tombstone
+    }
+    if err := n.walWriter.Write(entry); err != nil {
+        log.Printf("WAL write failed: %v", err)
+        return err
+    }
 
-	// Update store only after successful WAL write
-	n.storeMu.Lock()
-	defer n.storeMu.Unlock()
-	n.store[key] = &KeyValue{
-		Timestamp:   timestamp,
-		IsTombstone: true,
-		TTL:         86400,
-	}
-	return nil
+    // Update store only after successful WAL write
+    n.storeMu.Lock()
+    defer n.storeMu.Unlock()
+    n.store[key] = &KeyValue{
+        Timestamp:   timestamp,
+        CreatedAt:   timeNow().Unix(),
+        IsTombstone: true,
+        TTL:         86400,
+    }
+    return nil
 }
-
 func (n *Node) Get(key string) (string, uint64, bool) {
 	n.storeMu.RLock()
 	defer n.storeMu.RUnlock()
@@ -644,11 +655,13 @@ func (n *Node) recoverFromWAL() error {
 			n.store[entry.Key] = &KeyValue{
 				Value:     entry.Value,
 				Timestamp: entry.Timestamp,
+				CreatedAt: entry.CreatedAt,
 				TTL:       entry.TTL,
 			}
 		case "DELETE":
 			n.store[entry.Key] = &KeyValue{
 				Timestamp:   entry.Timestamp,
+				CreatedAt:   entry.CreatedAt,
 				IsTombstone: true,
 				TTL:         entry.TTL,
 			}
@@ -734,19 +747,20 @@ func (n *Node) startTTLCleanup() {
 }
 
 func (n *Node) cleanupExpiredEntries() {
-	n.storeMu.Lock()
-	defer n.storeMu.Unlock()
+    n.storeMu.Lock()
+    defer n.storeMu.Unlock()
 
-	now := timeNow().Unix()
-	for key, kv := range n.store {
-		// Check if TTL is set and if entry has expired
-		if kv.TTL > 0 {
-			expirationTime := int64(kv.Timestamp/1000) + int64(kv.TTL) // Convert timestamp to seconds
-			if now > expirationTime {
-				delete(n.store, key)
-			}
-		}
-	}
+    now := timeNow().Unix()
+    for key, kv := range n.store {
+        // Check if TTL is set and if entry has expired
+        if kv.TTL > 0 {
+            // TTL is in seconds, so add it directly to the creation time
+            expirationTime := kv.CreatedAt + int64(kv.TTL)
+            if now > expirationTime {
+                delete(n.store, key)
+            }
+        }
+    }
 }
 
 func (n *Node) Shutdown() error {

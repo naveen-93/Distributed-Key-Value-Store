@@ -23,16 +23,20 @@ var (
 	ErrNoNodes        = errors.New("no available nodes")
 	ErrConnectionFail = errors.New("failed to connect to servers")
 )
-
 const (
-	defaultReadQuorum  = 2
-	defaultWriteQuorum = 2
-	numReplicas        = 3
-	maxKeyLength       = 128
-	maxValueLength     = 2048
+   
+    maxKeyLength      = 128
+    maxValueLength    = 2048
 )
+// Enhanced ring health tracking
+type ringHealth struct {
+	lastSuccessfulUpdate time.Time
+	consecutiveFailures  int
+	lastError            error
+	mu                   sync.RWMutex
+}
 
-// Client represents a KVStore client
+// Client struct update
 type Client struct {
 	mu sync.RWMutex
 
@@ -49,6 +53,7 @@ type Client struct {
 	maxRetries     int
 	readQuorum     int
 	writeQuorum    int
+	numReplicas    int
 
 	// Ring update configuration
 	ringUpdateInterval time.Duration
@@ -61,6 +66,10 @@ type Client struct {
 	nodeStates  map[string]*nodeState
 	nodeStateMu sync.RWMutex
 	maxFailures int
+
+	ringHealth         ringHealth
+	healthyThreshold   time.Duration
+	unhealthyThreshold int
 }
 
 // Value with timestamp for conflict resolution
@@ -76,23 +85,47 @@ type nodeState struct {
 	failures    int
 }
 
-func NewClient(servers []string) (*Client, error) {
+type ClientConfig struct {
+	ReadQuorum     int
+	WriteQuorum    int
+	NumReplicas    int
+	DialTimeout    time.Duration
+	RequestTimeout time.Duration
+	MaxRetries     int
+}
+
+func NewClient(servers []string, config *ClientConfig) (*Client, error) {
 	if len(servers) == 0 {
 		return nil, fmt.Errorf("%w: at least one server required", ErrValidation)
+	}
+
+	// Use provided config or defaults
+	if config == nil {
+		config = &ClientConfig{
+			ReadQuorum:     2,
+			WriteQuorum:    2,
+			NumReplicas:    3,
+			DialTimeout:    5 * time.Second,
+			RequestTimeout: 2 * time.Second,
+			MaxRetries:     3,
+		}
 	}
 
 	client := &Client{
 		servers:            servers,
 		connections:        make(map[string]*grpc.ClientConn),
 		clients:            make(map[string]pb.KVStoreClient),
-		dialTimeout:        5 * time.Second,
-		requestTimeout:     2 * time.Second,
-		maxRetries:         3,
-		readQuorum:         defaultReadQuorum,
-		writeQuorum:        defaultWriteQuorum,
+		dialTimeout:        config.DialTimeout,
+		requestTimeout:     config.RequestTimeout,
+		maxRetries:         config.MaxRetries,
+		readQuorum:         config.ReadQuorum,
+		writeQuorum:        config.WriteQuorum,
+		numReplicas:        config.NumReplicas,
 		ringUpdateInterval: 30 * time.Second,
 		nodeStates:         make(map[string]*nodeState),
 		maxFailures:        3,
+		healthyThreshold:   5 * time.Minute,
+		unhealthyThreshold: 3,
 	}
 
 	if err := client.initConnections(); err != nil {
@@ -103,12 +136,18 @@ func NewClient(servers []string) (*Client, error) {
 		return nil, fmt.Errorf("initial ring update failed: %w", err)
 	}
 
-	client.startRingUpdates()
+	// Start ring health monitoring
+	client.startRingHealthMonitoring()
 	return client, nil
 }
 
 // Get retrieves a value with improved validation and error handling
 func (c *Client) Get(key string) (string, bool, error) {
+	if healthy, err := c.CheckRingHealth(); !healthy {
+		log.Printf("Warning: Ring health check failed: %v", err)
+		// Continue with operation but log the warning
+	}
+
 	if err := validateKey(key); err != nil {
 		return "", false, fmt.Errorf("%w: %v", ErrValidation, err)
 	}
@@ -183,6 +222,11 @@ func (c *Client) Get(key string) (string, bool, error) {
 
 // Put sets a value with improved validation and error handling
 func (c *Client) Put(key, value string) (string, bool, error) {
+	if healthy, err := c.CheckRingHealth(); !healthy {
+		log.Printf("Warning: Ring health check failed: %v", err)
+		// Continue with operation but log the warning
+	}
+
 	if err := validateKey(key); err != nil {
 		return "", false, fmt.Errorf("%w: %v", ErrValidation, err)
 	}
@@ -200,7 +244,6 @@ func (c *Client) Put(key, value string) (string, bool, error) {
 		Value:     value,
 		ClientId:  c.clientID,
 		RequestId: c.nextRequestID(),
-		Timestamp: uint64(time.Now().UnixNano()),
 	}
 
 	type putResult struct {
@@ -378,11 +421,11 @@ func (c *Client) getReplicaNodes(key string) []string {
 		return nil
 	}
 
-	nodes := make([]string, 0, numReplicas)
+	nodes := make([]string, 0, c.numReplicas)
 	nodes = append(nodes, primaryNode)
 
 	current := c.ring.HashKey(key)
-	for i := 1; i < numReplicas && len(nodes) < len(c.servers); i++ {
+	for i := 1; i < c.numReplicas && len(nodes) < len(c.servers); i++ {
 		next := c.ring.GetNextNode(current)
 		if next != "" && !contains(nodes, next) {
 			nodes = append(nodes, next)
@@ -513,53 +556,94 @@ func (c *Client) updateRing() error {
 
 			if err != nil {
 				updateErrors = append(updateErrors, fmt.Errorf("failed to update from %s: %v", server, err))
-				if c.recordNodeFailure(server) {
-					log.Printf("Node %s marked as dead after %d failures", server, c.maxFailures)
-				}
+				c.recordRingUpdateFailure(err)
 				continue
 			}
 
-			c.recordNodeSuccess(server)
-
 			// Only update if version is newer
 			if resp.Version > c.ringVersion {
-				newRing := consistenthash.NewRing(consistenthash.DefaultVirtualNodes)
-				for node, isActive := range resp.Nodes {
-					if isActive {
-						newRing.AddNode(node)
-					}
+				if err := c.applyRingUpdate(resp); err != nil {
+					updateErrors = append(updateErrors, err)
+					c.recordRingUpdateFailure(err)
+					continue
 				}
-				c.ring = newRing
-				c.ringVersion = resp.Version
-				c.lastRingUpdate = time.Unix(resp.UpdatedAt, 0)
 				updatedFromAny = true
+				c.recordRingUpdateSuccess()
 				break
 			}
 		}
 	}
 
-	// Only return error if we couldn't update from any server AND we don't have a valid ring
 	if !updatedFromAny && c.ring == nil {
 		return fmt.Errorf("failed to initialize ring: %v", updateErrors)
-	}
-
-	// Log errors but don't fail if we have a working ring
-	if len(updateErrors) > 0 {
-		log.Printf("Some ring updates failed: %v", updateErrors)
 	}
 
 	return nil
 }
 
-func (c *Client) startRingUpdates() {
+func (c *Client) recordRingUpdateSuccess() {
+	c.ringHealth.mu.Lock()
+	defer c.ringHealth.mu.Unlock()
+
+	c.ringHealth.lastSuccessfulUpdate = time.Now()
+	c.ringHealth.consecutiveFailures = 0
+	c.ringHealth.lastError = nil
+}
+
+func (c *Client) recordRingUpdateFailure(err error) {
+	c.ringHealth.mu.Lock()
+	defer c.ringHealth.mu.Unlock()
+
+	c.ringHealth.consecutiveFailures++
+	c.ringHealth.lastError = err
+}
+
+func (c *Client) startRingHealthMonitoring() {
 	go func() {
-		ticker := time.NewTicker(c.ringUpdateInterval)
+		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 
 		for range ticker.C {
-			if err := c.updateRing(); err != nil {
-				log.Printf("Ring update failed: %v", err)
+			healthy, err := c.CheckRingHealth()
+			if !healthy {
+				log.Printf("Ring health check failed: %v", err)
+				// Trigger immediate ring update attempt
+				if err := c.updateRing(); err != nil {
+					log.Printf("Failed to update ring after health check failure: %v", err)
+				}
 			}
 		}
 	}()
+}
+
+// Helper method to apply ring updates
+func (c *Client) applyRingUpdate(resp *pb.RingStateResponse) error {
+	newRing := consistenthash.NewRing(consistenthash.DefaultVirtualNodes)
+	for node, isActive := range resp.Nodes {
+		if isActive {
+			newRing.AddNode(node)
+		}
+	}
+	c.ring = newRing
+	c.ringVersion = resp.Version
+	c.lastRingUpdate = time.Unix(resp.UpdatedAt, 0)
+	return nil
+}
+
+// Enhanced ring health check
+func (c *Client) CheckRingHealth() (bool, error) {
+	c.ringHealth.mu.RLock()
+	defer c.ringHealth.mu.RUnlock()
+
+	if time.Since(c.ringHealth.lastSuccessfulUpdate) > c.healthyThreshold {
+		return false, fmt.Errorf("ring update too old: last success was %v ago",
+			time.Since(c.ringHealth.lastSuccessfulUpdate))
+	}
+
+	if c.ringHealth.consecutiveFailures >= c.unhealthyThreshold {
+		return false, fmt.Errorf("ring unstable: %d consecutive failures, last error: %v",
+			c.ringHealth.consecutiveFailures, c.ringHealth.lastError)
+	}
+
+	return true, nil
 }
