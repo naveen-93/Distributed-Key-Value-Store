@@ -50,6 +50,9 @@ type server struct {
 	// Rebalancing configuration
 	rebalanceConfig RebalanceConfig
 	rebalancing     atomic.Bool
+
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 type ServerConfig struct {
@@ -74,56 +77,41 @@ type RebalanceConfig struct {
 }
 
 func NewServer(nodeID string, config *ServerConfig) (*server, error) {
-	// Use provided config or defaults
-	if config == nil {
-		config = &ServerConfig{
-			syncInterval:      5 * time.Minute,
-			heartbeatInterval: time.Second,
-			replicationFactor: 3,
-			virtualNodes:      consistenthash.DefaultVirtualNodes,
-		}
-	}
+    if config.heartbeatInterval <= 0 {
+        return nil, fmt.Errorf("heartbeatInterval must be positive, got %v", config.heartbeatInterval)
+    }
+    if config.replicationFactor <= 0 {
+        return nil, fmt.Errorf("replicationFactor must be positive, got %d", config.replicationFactor)
+    }
+    if config.virtualNodes <= 0 {
+        return nil, fmt.Errorf("virtualNodes must be positive, got %d", config.virtualNodes)
+    }
 
-	// Validate or generate UUID
-	var nodeUUID uuid.UUID
-	var err error
+    ctx, cancel := context.WithCancel(context.Background())
+    s := &server{
+        nodeID:            nodeID,
+        store:             node.NewNode(uint32(consistenthash.HashString(nodeID)), config.replicationFactor),
+        ring:              consistenthash.NewRing(config.virtualNodes),
+        peers:             make(map[string]string),
+        clients:           make(map[string]pb.NodeInternalClient),
+        syncInterval:      config.syncInterval,
+        heartbeatInterval: config.heartbeatInterval,
+        replicationFactor: config.replicationFactor,
+        stopChan:          make(chan struct{}),
+        rebalanceConfig: RebalanceConfig{
+            BatchSize:     1000,
+            BatchTimeout:  30 * time.Second,
+            MaxConcurrent: 5,
+            RetryAttempts: 3,
+        },
+        ctx:    ctx,
+        cancel: cancel,
+    }
 
-	if nodeID == "" {
-		// Generate new UUID if none provided
-		nodeUUID = uuid.New()
-	} else {
-		// Parse provided ID as UUID
-		nodeUUID, err = uuid.Parse(nodeID)
-		if err != nil {
-			return nil, fmt.Errorf("invalid node ID format, must be UUID: %v", err)
-		}
-	}
-
-	// Use UUID string as node identifier
-	nodeIDString := nodeUUID.String()
-
-	s := &server{
-		nodeID:            nodeIDString,
-		store:             node.NewNode(uint32(consistenthash.HashString(nodeIDString)), config.replicationFactor),
-		ring:              consistenthash.NewRing(config.virtualNodes),
-		peers:             make(map[string]string),
-		clients:           make(map[string]pb.NodeInternalClient),
-		syncInterval:      config.syncInterval,
-		heartbeatInterval: config.heartbeatInterval,
-		replicationFactor: config.replicationFactor,
-		stopChan:          make(chan struct{}),
-		rebalanceConfig: RebalanceConfig{
-			BatchSize:     1000,
-			BatchTimeout:  30 * time.Second,
-			MaxConcurrent: 5,
-			RetryAttempts: 3,
-		},
-	}
-
-	// Add self to ring using full UUID
-	s.ring.AddNode(fmt.Sprintf("node-%s", nodeIDString))
-	s.startHeartbeat()
-	return s, nil
+    // Add self to ring using full UUID
+    s.ring.AddNode(fmt.Sprintf("node-%s", nodeID))
+    s.startHeartbeat()
+    return s, nil
 }
 
 func (s *server) addPeer(peerID string, addr string) error {
@@ -195,22 +183,29 @@ func validateKeyValue(key, value string) error {
 	return nil
 }
 
-// Update Put method to use common validation
 func (s *server) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
-	if err := validateKeyValue(req.Key, req.Value); err != nil {
-		return nil, err
-	}
+    if err := validateKeyValue(req.Key, req.Value); err != nil {
+        return nil, err
+    }
 
-	err := s.store.Store(req.Key, req.Value, req.Timestamp)
-	if err != nil {
-		return nil, err
-	}
+    // Generate timestamp
+    timestamp := uint64(time.Now().UnixNano())
 
-	oldValue, _, hadOldValue := s.store.Get(req.Key)
-	return &pb.PutResponse{
-		OldValue:    string(oldValue),
-		HadOldValue: hadOldValue,
-	}, nil
+    // Store locally first
+    err := s.store.Store(req.Key, req.Value, timestamp)
+    if err != nil {
+        return nil, err
+    }
+
+    // Replicate to other nodes asynchronously
+    s.replicateToNodes(req.Key, req.Value, timestamp)
+
+    // Return immediately after local store (eventual consistency)
+    oldValue, _, hadOldValue := s.store.Get(req.Key)
+    return &pb.PutResponse{
+        OldValue:    string(oldValue),
+        HadOldValue: hadOldValue,
+    }, nil
 }
 
 // Add helper method to check if this node is a designated replica for a key
@@ -529,6 +524,21 @@ func (s *server) handlePeerFailure(peerID string) {
 	s.rebalanceRing()
 }
 
+func (s *server) Stop() {
+	if s.cancel != nil {
+		s.cancel()
+	}
+}
+
+func (s *server) Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	s.ctx = ctx
+	s.cancel = cancel
+
+	// Start background services
+	go s.startHeartbeat()
+}
+
 func main() {
 	nodeID := flag.String("id", "", "Node ID (optional, must be valid UUID if provided)")
 	addr := flag.String("addr", ":50051", "Address to listen on")
@@ -606,4 +616,4 @@ func main() {
 		log.Printf("Error during shutdown: %v", err)
 	}
 	log.Println("Server stopped")
-}
+} 
