@@ -16,6 +16,7 @@ service NodeInternal {
   rpc SyncKeys(SyncRequest) returns (SyncResponse) {}
   rpc Heartbeat(Ping) returns (Pong) {}
   rpc GarbageCollect(GarbageCollectRequest) returns (GarbageCollectResponse) {}
+  rpc GetReplica(GetReplicaRequest) returns (GetReplicaResponse) {}
 }
 
 message GetRequest {
@@ -60,12 +61,13 @@ message ReplicateResponse {
 
 message SyncRequest {
   map<string, uint64> key_timestamps = 1;
-  map<string, uint64> tombstone_timestamps = 2;  // Track deletions
+  bytes bloom_filter = 2;  // Add Bloom filter field
+  map<string, string> key_ranges = 3;
 }
 
 message SyncResponse {
   map<string, KeyValue> missing = 1;
-  map<string, uint64> stale_tombstones = 2;  // For cleanup
+  map<string, uint64> deletions = 2;  // Changed from stale_tombstones to deletions
 }
 
 message KeyValue {
@@ -92,4 +94,26 @@ message RingStateResponse {
   uint64 version = 1;
   map<string, bool> nodes = 2;
   int64 updated_at = 3;
+}
+
+message GetReplicaRequest {
+  string key = 1;
+}
+
+message GetReplicaResponse {
+  string value = 1;
+  uint64 timestamp = 2;
+  bool exists = 3;
+  bool is_tombstone = 4;
+}
+
+// Add GarbageCollect message definitions
+message GarbageCollectRequest {
+    map<string, uint64> tombstone_timestamps = 1;
+}
+
+message GarbageCollectResponse {
+    bool success = 1;
+    string error = 2;
+    map<string, uint64> cleaned_keys = 3;
 }

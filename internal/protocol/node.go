@@ -11,6 +11,8 @@ import (
 	pb "Distributed-Key-Value-Store/kvstore/proto"
 	"Distributed-Key-Value-Store/pkg/consistenthash"
 
+	"github.com/bits-and-blooms/bloom/v3"
+
 	"fmt"
 	"strconv"
 	"strings"
@@ -50,7 +52,7 @@ type Node struct {
 	lastPhysicalTime int64
 }
 
-func NewNode(id uint32, store *node.Node) *Node {
+func NewNode(id uint32, store *node.Node, replicationFactor int) *Node {
 	return &Node{
 		ID:                id,
 		store:             store,
@@ -62,7 +64,7 @@ func NewNode(id uint32, store *node.Node) *Node {
 		ring:              consistenthash.NewRing(10),
 		ringVersion:       0,
 		stopChan:          make(chan struct{}),
-		replicationFactor: 3, // Default replication factor
+		replicationFactor: replicationFactor,
 	}
 }
 
@@ -79,40 +81,53 @@ func (n *Node) Replicate(ctx context.Context, req *pb.ReplicateRequest) (*pb.Rep
 	}, nil
 }
 
+// Add Bloom filter for efficient sync
+type SyncState struct {
+	filter        *bloom.BloomFilter
+	keyTimestamps map[string]uint64
+}
+
 // SyncKeys handles anti-entropy sync requests
 func (n *Node) SyncKeys(ctx context.Context, req *pb.SyncRequest) (*pb.SyncResponse, error) {
 	missing := make(map[string]*pb.KeyValue)
-	deletions := make(map[string]uint64)
+	filter := &bloom.BloomFilter{}
+	filter.GobDecode(req.BloomFilter)
 
 	// Process key ranges in batches
 	for start, end := range req.KeyRanges {
 		n.storeMu.RLock()
 		keys := n.store.GetKeys()
+		n.storeMu.RUnlock()
+
 		for _, key := range keys {
-			if key < start || key >= end {
-				continue
-			}
-
-			value, timestamp, exists := n.store.Get(key)
-			remoteTs := req.KeyTimestamps[key]
-
-			if !exists {
-				// Track deletions
-				deletions[key] = uint64(timestamp)
-			} else if int64(timestamp) > int64(remoteTs) {
-				missing[key] = &pb.KeyValue{
-					Value:     string(value),
-					Timestamp: uint64(timestamp),
-					Deleted:   !exists,
+			if key >= start && key <= end {
+				// Only check keys not in remote filter
+				if !filter.Test([]byte(key)) {
+					value, ts, exists := n.store.Get(key)
+					if exists {
+						missing[key] = &pb.KeyValue{
+							Value:     string(value),
+							Timestamp: ts,
+						}
+					}
+				} else {
+					// Key exists in both, check timestamp
+					if remoteTs, ok := req.KeyTimestamps[key]; ok {
+						value, ts, exists := n.store.Get(key)
+						if exists && ts > remoteTs {
+							missing[key] = &pb.KeyValue{
+								Value:     string(value),
+								Timestamp: ts,
+							}
+						}
+					}
 				}
 			}
 		}
-		n.storeMu.RUnlock()
 	}
 
 	return &pb.SyncResponse{
-		Missing:   missing,
-		Deletions: deletions,
+		Missing: missing,
 	}, nil
 }
 
@@ -132,8 +147,18 @@ func (n *Node) StartAntiEntropy() {
 }
 
 func (n *Node) performAntiEntropy() {
-	// Get local key ranges (e.g., divide keyspace into chunks)
-	keyRanges := n.getKeyRanges()
+	// Create Bloom filter for local keys
+	filter := bloom.NewWithEstimates(100000, 0.01) // Size and false positive rate
+	keyTimestamps := make(map[string]uint64)
+
+	// Add local keys to filter
+	n.storeMu.RLock()
+	for _, key := range n.store.GetKeys() {
+		filter.Add([]byte(key))
+		_, ts, _ := n.store.Get(key)
+		keyTimestamps[key] = ts
+	}
+	n.storeMu.RUnlock()
 
 	// Send to each node
 	for nodeID, client := range n.getClients() {
@@ -141,46 +166,31 @@ func (n *Node) performAntiEntropy() {
 			continue
 		}
 
-		// Sync each range separately
-		for start, end := range keyRanges {
-			keyTimestamps := make(map[string]uint64)
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+		encoded, err := filter.GobEncode()
+		if err != nil {
+			log.Printf("Failed to encode bloom filter: %v", err)
+			continue
+		}
+		resp, err := client.SyncKeys(ctx, &pb.SyncRequest{
+			KeyTimestamps: keyTimestamps,
+			BloomFilter:   encoded,
+		})
+		cancel()
 
-			// Get timestamps for keys in range
-			n.storeMu.RLock()
-			for _, key := range n.store.GetKeys() {
-				if key >= start && key < end {
-					_, timestamp, exists := n.store.Get(key)
-					if exists {
-						keyTimestamps[key] = uint64(timestamp)
-					}
-				}
-			}
-			n.storeMu.RUnlock()
+		if err != nil {
+			log.Printf("Anti-entropy with node %d failed: %v", nodeID, err)
+			continue
+		}
 
-			ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
-			resp, err := client.SyncKeys(ctx, &pb.SyncRequest{
-				KeyTimestamps: keyTimestamps,
-				KeyRanges:     map[string]string{start: end},
-			})
-			cancel()
-
-			if err != nil {
-				log.Printf("Anti-entropy with node %d failed: %v", nodeID, err)
-				continue
-			}
-
-			// Apply missing updates and deletions
-			n.storeMu.Lock()
-			for key, kv := range resp.Missing {
+		// Apply missing updates
+		n.storeMu.Lock()
+		for key, kv := range resp.Missing {
+			if !filter.Test([]byte(key)) || kv.Timestamp > keyTimestamps[key] {
 				n.store.Store(key, kv.Value, kv.Timestamp)
 			}
-			for key, ts := range resp.Deletions {
-				if _, existing, exists := n.store.Get(key); !exists || (ts) > existing {
-					n.store.Store(key, "", ts)
-				}
-			}
-			n.storeMu.Unlock()
 		}
+		n.storeMu.Unlock()
 	}
 }
 
@@ -517,14 +527,17 @@ func (n *Node) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, er
 }
 
 // Add a dedicated GetReplica method for more efficient single-key reads
-func (n *Node) GetReplica(ctx context.Context, key string) (string, uint64, bool, error) {
-	value, timestamp, exists := n.store.Get(key)
-	return string(value), timestamp, exists, nil
+func (n *Node) GetReplica(ctx context.Context, req *pb.GetReplicaRequest) (*pb.GetReplicaResponse, error) {
+	value, timestamp, exists := n.store.Get(req.Key)
+	return &pb.GetReplicaResponse{
+		Value:     string(value),
+		Timestamp: uint64(timestamp),
+		Exists:    exists,
+	}, nil
 }
 
-// Update Get to use the dedicated GetReplica method
+// Update Get to use GetReplica
 func (n *Node) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, error) {
-	// Calculate required quorum
 	readQuorum := (n.replicationFactor / 2) + 1
 	responses := make(chan struct {
 		value     string
@@ -533,16 +546,16 @@ func (n *Node) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, er
 		err       error
 	}, n.replicationFactor)
 
-	// Get local value using dedicated method
-	value, timestamp, exists, _ := n.GetReplica(ctx, req.Key)
+	// Get local value
+	value, timestamp, exists := n.store.Get(req.Key)
 	responses <- struct {
 		value     string
 		timestamp uint64
 		exists    bool
 		err       error
-	}{value, timestamp, exists, nil}
+	}{string(value), uint64(timestamp), exists, nil}
 
-	// Query replicas
+	// Query replicas using GetReplica
 	hash := n.ring.HashKey(req.Key)
 	currentHash := hash
 
@@ -554,14 +567,9 @@ func (n *Node) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, er
 
 		nodeID := uint32(n.ring.HashKey(nextNodeID))
 		if client, ok := n.clients[nodeID]; ok {
-			go func(c pb.NodeInternalClient, key string) {
-				// Use optimized single-key request
-				syncReq := &pb.SyncRequest{
-					KeyTimestamps: map[string]uint64{key: 0}, // Request latest value
-					KeyRanges:     map[string]string{},       // Empty ranges for single-key request
-				}
-
-				resp, err := c.SyncKeys(ctx, syncReq)
+			go func(c pb.NodeInternalClient) {
+				replicaReq := &pb.GetReplicaRequest{Key: req.Key}
+				resp, err := c.GetReplica(ctx, replicaReq)
 				if err != nil {
 					responses <- struct {
 						value     string
@@ -571,23 +579,13 @@ func (n *Node) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, er
 					}{"", 0, false, err}
 					return
 				}
-
-				if kv, exists := resp.Missing[key]; exists {
-					responses <- struct {
-						value     string
-						timestamp uint64
-						exists    bool
-						err       error
-					}{kv.Value, kv.Timestamp, true, nil}
-				} else {
-					responses <- struct {
-						value     string
-						timestamp uint64
-						exists    bool
-						err       error
-					}{"", 0, false, nil}
-				}
-			}(client, req.Key)
+				responses <- struct {
+					value     string
+					timestamp uint64
+					exists    bool
+					err       error
+				}{resp.Value, resp.Timestamp, resp.Exists, nil}
+			}(client)
 		}
 		currentHash = n.ring.HashKey(nextNodeID)
 	}

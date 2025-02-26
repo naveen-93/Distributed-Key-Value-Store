@@ -23,11 +23,12 @@ var (
 	ErrNoNodes        = errors.New("no available nodes")
 	ErrConnectionFail = errors.New("failed to connect to servers")
 )
+
 const (
-   
-    maxKeyLength      = 128
-    maxValueLength    = 2048
+	maxKeyLength   = 128
+	maxValueLength = 2048
 )
+
 // Enhanced ring health tracking
 type ringHealth struct {
 	lastSuccessfulUpdate time.Time
@@ -94,6 +95,15 @@ type ClientConfig struct {
 	MaxRetries     int
 }
 
+// Add new types for two-phase read
+type readResponse struct {
+	value     string
+	timestamp uint64
+	exists    bool
+	nodeAddr  string
+	err       error
+}
+
 func NewClient(servers []string, config *ClientConfig) (*Client, error) {
 	if len(servers) == 0 {
 		return nil, fmt.Errorf("%w: at least one server required", ErrValidation)
@@ -152,72 +162,145 @@ func (c *Client) Get(key string) (string, bool, error) {
 		return "", false, fmt.Errorf("%w: %v", ErrValidation, err)
 	}
 
-	nodes := c.getReplicaNodes(key)
-	if len(nodes) == 0 {
-		return "", false, ErrNoNodes
+	// Phase 1: Collect all responses
+	candidate, responses, err := c.collectReadResponses(key)
+	if err != nil {
+		return "", false, err
 	}
 
-	req := &pb.GetRequest{
-		Key:       key,
-		ClientId:  c.clientID,
-		RequestId: c.nextRequestID(),
+	// Phase 2: Confirm candidate value
+	confirmed, err := c.confirmValue(key, candidate, responses)
+	if err != nil {
+		return "", false, err
 	}
+
+	if !confirmed {
+		return "", false, fmt.Errorf("failed to confirm consistent value across quorum")
+	}
+
+	// Perform read repair only after confirming the true latest value
+	go c.performReadRepair(key, candidate, responses)
+
+	return candidate.value, candidate.exists, nil
+}
+
+// Phase 1: Collect responses from all replicas
+func (c *Client) collectReadResponses(key string) (valueWithTimestamp, []readResponse, error) {
+	nodes := c.getReplicaNodes(key)
+	if len(nodes) == 0 {
+		return valueWithTimestamp{}, nil, ErrNoNodes
+	}
+
+	responses := make(chan readResponse, len(nodes))
+	var wg sync.WaitGroup
 
 	ctx, cancel := context.WithTimeout(context.Background(), c.requestTimeout)
 	defer cancel()
 
-	responses := make(chan valueWithTimestamp, len(nodes))
-	errs := make(chan error, len(nodes))
-	var wg sync.WaitGroup
-
-	// Query all replicas concurrently with improved error handling
+	// Query all replicas concurrently
 	for _, node := range nodes {
 		wg.Add(1)
 		go func(addr string) {
 			defer wg.Done()
-			if err := c.retryWithBackoff(func() error {
-				client := c.clients[addr]
-				resp, err := client.Get(ctx, req)
-				if err != nil {
-					return err
-				}
-				responses <- valueWithTimestamp{
-					value:     resp.Value,
-					timestamp: resp.Timestamp,
-					exists:    resp.Exists,
-					nodeAddr:  addr,
-				}
-				return nil
-			}); err != nil {
-				errs <- fmt.Errorf("failed to read from %s: %w", addr, err)
+
+			client := c.clients[addr]
+			resp, err := client.Get(ctx, &pb.GetRequest{Key: key})
+
+			if err != nil {
+				responses <- readResponse{err: err, nodeAddr: addr}
+				return
+			}
+
+			responses <- readResponse{
+				value:     resp.Value,
+				timestamp: resp.Timestamp,
+				exists:    resp.Exists,
+				nodeAddr:  addr,
 			}
 		}(node)
 	}
 
-	// Wait for all goroutines to complete
+	// Wait for all responses or timeout
 	go func() {
 		wg.Wait()
 		close(responses)
-		close(errs)
 	}()
 
-	// Collect responses and errors
-	var values []valueWithTimestamp
-	var errors []error
+	// Collect responses
+	var allResponses []readResponse
+	var validResponses []valueWithTimestamp
+
 	for resp := range responses {
-		values = append(values, resp)
-	}
-	for err := range errs {
-		errors = append(errors, err)
+		if resp.err == nil {
+			validResponses = append(validResponses, valueWithTimestamp{
+				value:     resp.value,
+				timestamp: resp.timestamp,
+				exists:    resp.exists,
+				nodeAddr:  resp.nodeAddr,
+			})
+		}
+		allResponses = append(allResponses, resp)
 	}
 
-	if len(values) < c.readQuorum {
-		return "", false, fmt.Errorf("%w: got %d responses, need %d", ErrQuorumNotMet, len(values), c.readQuorum)
+	if len(validResponses) < c.readQuorum {
+		return valueWithTimestamp{}, allResponses, ErrQuorumNotMet
 	}
 
-	latest := c.resolveConflicts(values)
-	go c.performReadRepair(key, latest, values)
-	return latest.value, latest.exists, nil
+	// Identify candidate (latest value)
+	candidate := c.resolveConflicts(validResponses)
+	return candidate, allResponses, nil
+}
+
+// Phase 2: Confirm candidate value with quorum
+func (c *Client) confirmValue(key string, candidate valueWithTimestamp, responses []readResponse) (bool, error) {
+	matchCount := 0
+
+	// Count nodes that have the candidate value
+	for _, resp := range responses {
+		if resp.err == nil &&
+			resp.timestamp == candidate.timestamp &&
+			resp.value == candidate.value {
+			matchCount++
+		}
+	}
+
+	// Check if we have quorum agreement
+	return matchCount >= c.readQuorum, nil
+}
+
+// Updated read repair to ensure consistent propagation
+func (c *Client) performReadRepair(key string, confirmed valueWithTimestamp, responses []readResponse) {
+	ctx, cancel := context.WithTimeout(context.Background(), c.requestTimeout)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	for _, resp := range responses {
+		// Skip nodes that already have the correct value
+		if resp.timestamp >= confirmed.timestamp {
+			continue
+		}
+
+		wg.Add(1)
+		go func(addr string) {
+			defer wg.Done()
+
+			req := &pb.PutRequest{
+				Key:       key,
+				Value:     confirmed.value,
+				ClientId:  c.clientID,
+				RequestId: c.nextRequestID(),
+				Timestamp: confirmed.timestamp,
+			}
+
+			client := c.clients[addr]
+			_, err := client.Put(ctx, req)
+			if err != nil {
+				log.Printf("Read repair failed for %s on %s: %v", key, addr, err)
+			}
+		}(resp.nodeAddr)
+	}
+
+	wg.Wait()
 }
 
 // Put sets a value with improved validation and error handling
@@ -427,14 +510,25 @@ func (c *Client) getReplicaNodes(key string) []string {
 	current := c.ring.HashKey(key)
 	for i := 1; i < c.numReplicas && len(nodes) < len(c.servers); i++ {
 		next := c.ring.GetNextNode(current)
-		if next != "" && !contains(nodes, next) {
+		if next != "" && !contains(nodes, next) && c.isNodeHealthy(next) {
 			nodes = append(nodes, next)
 		}
 		current = c.ring.HashKey(next)
 	}
-
 	return nodes
 }
+
+func (c *Client) isNodeHealthy(node string) bool {
+	c.nodeStateMu.RLock()
+	defer c.nodeStateMu.RUnlock()
+
+	state, exists := c.nodeStates[node]
+	if !exists {
+		return true // New nodes are assumed healthy
+	}
+	return state.failures < c.maxFailures && time.Since(state.lastSuccess) < c.healthyThreshold
+}
+
 func (c *Client) resolveConflicts(values []valueWithTimestamp) valueWithTimestamp {
 	if len(values) == 0 {
 		return valueWithTimestamp{}
@@ -449,36 +543,6 @@ func (c *Client) resolveConflicts(values []valueWithTimestamp) valueWithTimestam
 	})
 
 	return values[0]
-}
-
-func (c *Client) performReadRepair(key string, latest valueWithTimestamp, values []valueWithTimestamp) {
-	for _, val := range values {
-		if val.timestamp < latest.timestamp {
-			// Create context for each repair operation
-			ctx, cancel := context.WithTimeout(context.Background(), c.requestTimeout)
-
-			req := &pb.PutRequest{
-				Key:       key,
-				Value:     latest.value,
-				ClientId:  c.clientID,
-				RequestId: c.nextRequestID(),
-				Timestamp: latest.timestamp,
-			}
-
-			err := c.retryWithBackoff(func() error {
-				client := c.clients[val.nodeAddr]
-				_, err := client.Put(ctx, req)
-				return err
-			})
-
-			cancel() // Cancel after retry attempts
-
-			if err != nil {
-				log.Printf("Read repair failed for %s on %s after retries: %v",
-					key, val.nodeAddr, err)
-			}
-		}
-	}
 }
 
 func contains(slice []string, str string) bool {

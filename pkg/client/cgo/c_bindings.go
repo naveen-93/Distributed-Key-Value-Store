@@ -37,7 +37,9 @@ func kv_init(serverList **C.char) C.int {
 
 	// Create new client
 	var err error
-	globalClient, err = client.NewClient(servers)
+	globalClient, err = client.NewClient(servers, &client.ClientConfig{
+		RingUpdateInterval: 30 * time.Second,
+	})
 	if err != nil {
 		return C.int(-1)
 	}

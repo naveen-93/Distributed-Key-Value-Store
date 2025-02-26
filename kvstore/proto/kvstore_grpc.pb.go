@@ -201,9 +201,11 @@ var KVStore_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	NodeInternal_Replicate_FullMethodName = "/kvstore.NodeInternal/Replicate"
-	NodeInternal_SyncKeys_FullMethodName  = "/kvstore.NodeInternal/SyncKeys"
-	NodeInternal_Heartbeat_FullMethodName = "/kvstore.NodeInternal/Heartbeat"
+	NodeInternal_Replicate_FullMethodName      = "/kvstore.NodeInternal/Replicate"
+	NodeInternal_SyncKeys_FullMethodName       = "/kvstore.NodeInternal/SyncKeys"
+	NodeInternal_Heartbeat_FullMethodName      = "/kvstore.NodeInternal/Heartbeat"
+	NodeInternal_GarbageCollect_FullMethodName = "/kvstore.NodeInternal/GarbageCollect"
+	NodeInternal_GetReplica_FullMethodName     = "/kvstore.NodeInternal/GetReplica"
 )
 
 // NodeInternalClient is the client API for NodeInternal service.
@@ -215,6 +217,8 @@ type NodeInternalClient interface {
 	Replicate(ctx context.Context, in *ReplicateRequest, opts ...grpc.CallOption) (*ReplicateResponse, error)
 	SyncKeys(ctx context.Context, in *SyncRequest, opts ...grpc.CallOption) (*SyncResponse, error)
 	Heartbeat(ctx context.Context, in *Ping, opts ...grpc.CallOption) (*Pong, error)
+	GarbageCollect(ctx context.Context, in *GarbageCollectRequest, opts ...grpc.CallOption) (*GarbageCollectResponse, error)
+	GetReplica(ctx context.Context, in *GetReplicaRequest, opts ...grpc.CallOption) (*GetReplicaResponse, error)
 }
 
 type nodeInternalClient struct {
@@ -255,6 +259,26 @@ func (c *nodeInternalClient) Heartbeat(ctx context.Context, in *Ping, opts ...gr
 	return out, nil
 }
 
+func (c *nodeInternalClient) GarbageCollect(ctx context.Context, in *GarbageCollectRequest, opts ...grpc.CallOption) (*GarbageCollectResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GarbageCollectResponse)
+	err := c.cc.Invoke(ctx, NodeInternal_GarbageCollect_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *nodeInternalClient) GetReplica(ctx context.Context, in *GetReplicaRequest, opts ...grpc.CallOption) (*GetReplicaResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetReplicaResponse)
+	err := c.cc.Invoke(ctx, NodeInternal_GetReplica_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // NodeInternalServer is the server API for NodeInternal service.
 // All implementations must embed UnimplementedNodeInternalServer
 // for forward compatibility.
@@ -264,6 +288,8 @@ type NodeInternalServer interface {
 	Replicate(context.Context, *ReplicateRequest) (*ReplicateResponse, error)
 	SyncKeys(context.Context, *SyncRequest) (*SyncResponse, error)
 	Heartbeat(context.Context, *Ping) (*Pong, error)
+	GarbageCollect(context.Context, *GarbageCollectRequest) (*GarbageCollectResponse, error)
+	GetReplica(context.Context, *GetReplicaRequest) (*GetReplicaResponse, error)
 	mustEmbedUnimplementedNodeInternalServer()
 }
 
@@ -282,6 +308,12 @@ func (UnimplementedNodeInternalServer) SyncKeys(context.Context, *SyncRequest) (
 }
 func (UnimplementedNodeInternalServer) Heartbeat(context.Context, *Ping) (*Pong, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Heartbeat not implemented")
+}
+func (UnimplementedNodeInternalServer) GarbageCollect(context.Context, *GarbageCollectRequest) (*GarbageCollectResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GarbageCollect not implemented")
+}
+func (UnimplementedNodeInternalServer) GetReplica(context.Context, *GetReplicaRequest) (*GetReplicaResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetReplica not implemented")
 }
 func (UnimplementedNodeInternalServer) mustEmbedUnimplementedNodeInternalServer() {}
 func (UnimplementedNodeInternalServer) testEmbeddedByValue()                      {}
@@ -358,6 +390,42 @@ func _NodeInternal_Heartbeat_Handler(srv interface{}, ctx context.Context, dec f
 	return interceptor(ctx, in, info, handler)
 }
 
+func _NodeInternal_GarbageCollect_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GarbageCollectRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NodeInternalServer).GarbageCollect(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NodeInternal_GarbageCollect_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NodeInternalServer).GarbageCollect(ctx, req.(*GarbageCollectRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _NodeInternal_GetReplica_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetReplicaRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NodeInternalServer).GetReplica(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NodeInternal_GetReplica_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NodeInternalServer).GetReplica(ctx, req.(*GetReplicaRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // NodeInternal_ServiceDesc is the grpc.ServiceDesc for NodeInternal service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -376,6 +444,14 @@ var NodeInternal_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Heartbeat",
 			Handler:    _NodeInternal_Heartbeat_Handler,
+		},
+		{
+			MethodName: "GarbageCollect",
+			Handler:    _NodeInternal_GarbageCollect_Handler,
+		},
+		{
+			MethodName: "GetReplica",
+			Handler:    _NodeInternal_GetReplica_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
