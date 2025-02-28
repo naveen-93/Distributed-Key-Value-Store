@@ -1,6 +1,5 @@
 package protocol
 
-
 import (
 	"context"
 	"log"
@@ -12,7 +11,8 @@ import (
 	pb "Distributed-Key-Value-Store/kvstore/proto"
 	"Distributed-Key-Value-Store/pkg/consistenthash"
 
-	"google.golang.org/grpc"
+	"github.com/bits-and-blooms/bloom/v3"
+
 	"fmt"
 	"strconv"
 	"strings"
@@ -43,10 +43,16 @@ type Node struct {
 
 	// Ring state
 	ringVersion uint64
-	stopChan     chan struct{}
+	stopChan    chan struct{}
+
+	// Added for replication factor
+	replicationFactor int
+
+	// Added for hybrid logical clock
+	lastPhysicalTime int64
 }
 
-func NewNode(id uint32, store *node.Node) *Node {
+func NewNode(id uint32, store *node.Node, replicationFactor int) *Node {
 	return &Node{
 		ID:                id,
 		store:             store,
@@ -57,7 +63,8 @@ func NewNode(id uint32, store *node.Node) *Node {
 		heartbeatInterval: time.Second,
 		ring:              consistenthash.NewRing(10),
 		ringVersion:       0,
-		stopChan:  make(chan struct{}),
+		stopChan:          make(chan struct{}),
+		replicationFactor: replicationFactor,
 	}
 }
 
@@ -74,40 +81,53 @@ func (n *Node) Replicate(ctx context.Context, req *pb.ReplicateRequest) (*pb.Rep
 	}, nil
 }
 
+// Add Bloom filter for efficient sync
+type SyncState struct {
+	filter        *bloom.BloomFilter
+	keyTimestamps map[string]uint64
+}
+
 // SyncKeys handles anti-entropy sync requests
 func (n *Node) SyncKeys(ctx context.Context, req *pb.SyncRequest) (*pb.SyncResponse, error) {
 	missing := make(map[string]*pb.KeyValue)
-	deletions := make(map[string]uint64)
+	filter := &bloom.BloomFilter{}
+	filter.GobDecode(req.BloomFilter)
 
 	// Process key ranges in batches
 	for start, end := range req.KeyRanges {
 		n.storeMu.RLock()
 		keys := n.store.GetKeys()
+		n.storeMu.RUnlock()
+
 		for _, key := range keys {
-			if key < start || key >= end {
-				continue
-			}
-
-			value, timestamp, exists := n.store.Get(key)
-			remoteTs := req.KeyTimestamps[key]
-
-			if !exists {
-				// Track deletions
-				deletions[key] = uint64(timestamp)
-			} else if int64(timestamp) > int64(remoteTs) {
-				missing[key] = &pb.KeyValue{
-					Value:     string(value),
-					Timestamp: uint64(timestamp),
-					Deleted:   !exists,
+			if key >= start && key <= end {
+				// Only check keys not in remote filter
+				if !filter.Test([]byte(key)) {
+					value, ts, exists := n.store.Get(key)
+					if exists {
+						missing[key] = &pb.KeyValue{
+							Value:     string(value),
+							Timestamp: ts,
+						}
+					}
+				} else {
+					// Key exists in both, check timestamp
+					if remoteTs, ok := req.KeyTimestamps[key]; ok {
+						value, ts, exists := n.store.Get(key)
+						if exists && ts > remoteTs {
+							missing[key] = &pb.KeyValue{
+								Value:     string(value),
+								Timestamp: ts,
+							}
+						}
+					}
 				}
 			}
 		}
-		n.storeMu.RUnlock()
 	}
 
 	return &pb.SyncResponse{
-		Missing:   missing,
-		Deletions: deletions,
+		Missing: missing,
 	}, nil
 }
 
@@ -127,8 +147,18 @@ func (n *Node) StartAntiEntropy() {
 }
 
 func (n *Node) performAntiEntropy() {
-	// Get local key ranges (e.g., divide keyspace into chunks)
-	keyRanges := n.getKeyRanges()
+	// Create Bloom filter for local keys
+	filter := bloom.NewWithEstimates(100000, 0.01) // Size and false positive rate
+	keyTimestamps := make(map[string]uint64)
+
+	// Add local keys to filter
+	n.storeMu.RLock()
+	for _, key := range n.store.GetKeys() {
+		filter.Add([]byte(key))
+		_, ts, _ := n.store.Get(key)
+		keyTimestamps[key] = ts
+	}
+	n.storeMu.RUnlock()
 
 	// Send to each node
 	for nodeID, client := range n.getClients() {
@@ -136,46 +166,31 @@ func (n *Node) performAntiEntropy() {
 			continue
 		}
 
-		// Sync each range separately
-		for start, end := range keyRanges {
-			keyTimestamps := make(map[string]uint64)
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+		encoded, err := filter.GobEncode()
+		if err != nil {
+			log.Printf("Failed to encode bloom filter: %v", err)
+			continue
+		}
+		resp, err := client.SyncKeys(ctx, &pb.SyncRequest{
+			KeyTimestamps: keyTimestamps,
+			BloomFilter:   encoded,
+		})
+		cancel()
 
-			// Get timestamps for keys in range
-			n.storeMu.RLock()
-			for _, key := range n.store.GetKeys() {
-				if key >= start && key < end {
-					_, timestamp, exists := n.store.Get(key)
-					if exists {
-						keyTimestamps[key] = uint64(timestamp)
-					}
-				}
-			}
-			n.storeMu.RUnlock()
+		if err != nil {
+			log.Printf("Anti-entropy with node %d failed: %v", nodeID, err)
+			continue
+		}
 
-			ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
-			resp, err := client.SyncKeys(ctx, &pb.SyncRequest{
-				KeyTimestamps: keyTimestamps,
-				KeyRanges:     map[string]string{start: end},
-			})
-			cancel()
-
-			if err != nil {
-				log.Printf("Anti-entropy with node %d failed: %v", nodeID, err)
-				continue
-			}
-
-			// Apply missing updates and deletions
-			n.storeMu.Lock()
-			for key, kv := range resp.Missing {
+		// Apply missing updates
+		n.storeMu.Lock()
+		for key, kv := range resp.Missing {
+			if !filter.Test([]byte(key)) || kv.Timestamp > keyTimestamps[key] {
 				n.store.Store(key, kv.Value, kv.Timestamp)
 			}
-			for key, ts := range resp.Deletions {
-				if _, existing, exists := n.store.Get(key); !exists || (ts) > existing {
-					n.store.Store(key, "", ts)
-				}
-			}
-			n.storeMu.Unlock()
 		}
+		n.storeMu.Unlock()
 	}
 }
 
@@ -201,12 +216,28 @@ func (n *Node) getKeyRanges() map[string]string {
 	return ranges
 }
 
-// getTimestamp generates a new timestamp for writes
+// Update getTimestamp with hybrid logical clock implementation
 func (n *Node) getTimestamp(key string) uint64 {
 	n.storeMu.Lock()
 	defer n.storeMu.Unlock()
-	n.logicalClock++
-	return (uint64(n.ID) << 32) | n.logicalClock
+
+	// Get current physical time in milliseconds
+	now := time.Now().UnixNano() / 1000000
+
+	// Ensure physical clock is monotonic
+	if now > n.lastPhysicalTime {
+		n.lastPhysicalTime = now
+		n.logicalClock = 0
+	} else {
+		// Same millisecond, increment logical clock
+		n.logicalClock++
+	}
+
+	// Combine physical and logical components
+	// Format: 48 bits physical time | 16 bits logical clock
+	timestamp := (uint64(n.lastPhysicalTime) << 16) | (n.logicalClock & 0xFFFF)
+
+	return timestamp
 }
 
 // getLocalTimestamp retrieves the stored timestamp without incrementing
@@ -331,7 +362,7 @@ func (n *Node) rebalanceRing() {
 				go func(k, v string, ts uint64, target string) {
 					for retries := 0; retries < 3; retries++ {
 						if err := n.replicateKey(k, v, ts, target); err != nil {
-							log.Printf("Failed to replicate key %s to %s (attempt %d/3): %v", 
+							log.Printf("Failed to replicate key %s to %s (attempt %d/3): %v",
 								k, target, retries+1, err)
 							time.Sleep(time.Second * time.Duration(retries+1))
 							continue
@@ -343,7 +374,6 @@ func (n *Node) rebalanceRing() {
 		}
 	}
 }
-
 
 // replicateKey handles the replication of a single key to a target node
 func (n *Node) replicateKey(key, value string, timestamp uint64, targetNode string) error {
@@ -424,8 +454,12 @@ func (n *Node) IsPrimary(key string) bool {
 	return n.ID == hash
 }
 
-// Put handles incoming write requests
+// Put handles incoming write requests with quorum enforcement
 func (n *Node) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
+	// Calculate required quorum
+	writeQuorum := (n.replicationFactor / 2) + 1
+	successCount := 1 // Count self as first success
+
 	// Generate timestamp for this write
 	timestamp := n.getTimestamp(req.Key)
 
@@ -433,8 +467,58 @@ func (n *Node) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, er
 	oldValue, _, hadOldValue := n.store.Get(req.Key)
 	n.store.Store(req.Key, req.Value, timestamp)
 
-	// Replicate to other nodes
-	n.replicateToNodes(req.Key, req.Value, timestamp)
+	// Replicate to other nodes and wait for quorum
+	responses := make(chan error, n.replicationFactor-1)
+
+	// Get replica nodes using consistent hashing
+	hash := n.ring.HashKey(req.Key)
+	currentHash := hash
+
+	// Send to next nodes in the ring
+	for i := 1; i < n.replicationFactor; i++ {
+		// Get next node in ring
+		nextNodeID := n.ring.GetNextNode(currentHash)
+		if nextNodeID == "" {
+			break // No more nodes available
+		}
+
+		// Convert node ID format to uint32
+		nodeID := uint32(n.ring.HashKey(nextNodeID))
+		if client, exists := n.clients[nodeID]; exists {
+			go func(c pb.NodeInternalClient) {
+				replicaReq := &pb.ReplicateRequest{
+					Key:       req.Key,
+					Value:     req.Value,
+					Timestamp: timestamp,
+				}
+				_, err := c.Replicate(ctx, replicaReq)
+				responses <- err
+			}(client)
+		}
+		currentHash = n.ring.HashKey(nextNodeID)
+	}
+
+	// Wait for quorum
+	for i := 1; i < n.replicationFactor; i++ {
+		select {
+		case err := <-responses:
+			if err == nil {
+				successCount++
+				if successCount >= writeQuorum {
+					return &pb.PutResponse{
+						OldValue:    string(oldValue),
+						HadOldValue: hadOldValue,
+					}, nil
+				}
+			}
+		case <-ctx.Done():
+			return nil, fmt.Errorf("failed to achieve write quorum: %v", ctx.Err())
+		}
+	}
+
+	if successCount < writeQuorum {
+		return nil, fmt.Errorf("failed to achieve write quorum: got %d, need %d", successCount, writeQuorum)
+	}
 
 	return &pb.PutResponse{
 		OldValue:    string(oldValue),
@@ -442,80 +526,40 @@ func (n *Node) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, er
 	}, nil
 }
 
-// Node management methods
-func (n *Node) AddNode(nodeID uint32, addr string) error {
-	n.storeMu.Lock()
-	defer n.storeMu.Unlock()
-
-	// Add to node list
-	n.nodes[nodeID] = addr
-	n.nodeStatus[nodeID] = true
-
-	// Initialize gRPC connection
-	conn, err := grpc.Dial(addr, grpc.WithInsecure())
-	if err != nil {
-		delete(n.nodes, nodeID)
-		return err
-	}
-
-	// Create client
-	n.clientsMu.Lock()
-	n.clients[nodeID] = pb.NewNodeInternalClient(conn)
-	n.clientsMu.Unlock()
-
-	return nil
-}
-
-func (n *Node) RemoveNode(nodeID uint32) {
-	n.storeMu.Lock()
-	defer n.storeMu.Unlock()
-
-	// Clean up client connection
-	n.clientsMu.Lock()
-	if _, exists := n.clients[nodeID]; exists {
-		delete(n.clients, nodeID)
-	}
-	n.clientsMu.Unlock()
-
-	// Remove from node list
-	delete(n.nodes, nodeID)
-	delete(n.nodeStatus, nodeID)
-}
-
-func (n *Node) GetNodes() map[uint32]string {
-	n.storeMu.RLock()
-	defer n.storeMu.RUnlock()
-
-	nodes := make(map[uint32]string)
-	for id, addr := range n.nodes {
-		nodes[id] = addr
-	}
-	return nodes
-}
-
-func (n *Node) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, error) {
-	// Get local value
+// Add a dedicated GetReplica method for more efficient single-key reads
+func (n *Node) GetReplica(ctx context.Context, req *pb.GetReplicaRequest) (*pb.GetReplicaResponse, error) {
 	value, timestamp, exists := n.store.Get(req.Key)
+	return &pb.GetReplicaResponse{
+		Value:     string(value),
+		Timestamp: uint64(timestamp),
+		Exists:    exists,
+	}, nil
+}
 
-	// Get replica nodes for this key
-	currentHash := n.ring.HashKey(req.Key)
-	replicaValues := make([]struct {
+// Update Get to use GetReplica
+func (n *Node) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, error) {
+	readQuorum := (n.replicationFactor / 2) + 1
+	responses := make(chan struct {
 		value     string
 		timestamp uint64
-		nodeID    uint32
-	}, 0)
+		exists    bool
+		err       error
+	}, n.replicationFactor)
 
-	// Add local value
-	if exists {
-		replicaValues = append(replicaValues, struct {
-			value     string
-			timestamp uint64
-			nodeID    uint32
-		}{string(value), uint64(timestamp), n.ID})
-	}
+	// Get local value
+	value, timestamp, exists := n.store.Get(req.Key)
+	responses <- struct {
+		value     string
+		timestamp uint64
+		exists    bool
+		err       error
+	}{string(value), uint64(timestamp), exists, nil}
 
-	// Query other replicas
-	for i := 0; i < 2; i++ { // Check 2 other replicas
+	// Query replicas using GetReplica
+	hash := n.ring.HashKey(req.Key)
+	currentHash := hash
+
+	for i := 1; i < n.replicationFactor; i++ {
 		nextNodeID := n.ring.GetNextNode(currentHash)
 		if nextNodeID == "" {
 			break
@@ -523,48 +567,67 @@ func (n *Node) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, er
 
 		nodeID := uint32(n.ring.HashKey(nextNodeID))
 		if client, ok := n.clients[nodeID]; ok {
-			// Use SyncKeys for node-to-node communication
-			resp, err := client.SyncKeys(ctx, &pb.SyncRequest{
-				KeyTimestamps: map[string]uint64{req.Key: 0}, // Request latest value
-			})
-			if err == nil {
-				if kv, exists := resp.Missing[req.Key]; exists {
-					replicaValues = append(replicaValues, struct {
+			go func(c pb.NodeInternalClient) {
+				replicaReq := &pb.GetReplicaRequest{Key: req.Key}
+				resp, err := c.GetReplica(ctx, replicaReq)
+				if err != nil {
+					responses <- struct {
 						value     string
 						timestamp uint64
-						nodeID    uint32
-					}{kv.Value, kv.Timestamp, nodeID})
+						exists    bool
+						err       error
+					}{"", 0, false, err}
+					return
 				}
-			}
+				responses <- struct {
+					value     string
+					timestamp uint64
+					exists    bool
+					err       error
+				}{resp.Value, resp.Timestamp, resp.Exists, nil}
+			}(client)
 		}
 		currentHash = n.ring.HashKey(nextNodeID)
 	}
 
-	// Find latest value
+	// Wait for quorum and find latest value
+	successCount := 0
 	var latest struct {
 		value     string
 		timestamp uint64
 		exists    bool
 	}
 
-	for _, rv := range replicaValues {
-		if rv.timestamp > latest.timestamp {
-			latest.value = rv.value
-			latest.timestamp = rv.timestamp
-			latest.exists = true
+	for i := 0; i < n.replicationFactor; i++ {
+		select {
+		case resp := <-responses:
+			if resp.err == nil {
+				successCount++
+				if resp.exists && resp.timestamp > latest.timestamp {
+					latest = struct {
+						value     string
+						timestamp uint64
+						exists    bool
+					}{resp.value, resp.timestamp, true}
+				}
+				if successCount >= readQuorum {
+					// Perform read repair if needed
+					if latest.exists && latest.timestamp > timestamp {
+						go n.store.Store(req.Key, latest.value, latest.timestamp)
+					}
+					return &pb.GetResponse{
+						Value:     latest.value,
+						Exists:    latest.exists,
+						Timestamp: latest.timestamp,
+					}, nil
+				}
+			}
+		case <-ctx.Done():
+			return nil, fmt.Errorf("failed to achieve read quorum: %v", ctx.Err())
 		}
 	}
 
-	// Perform read repair if needed
-	if latest.exists && (latest.timestamp) > timestamp {
-		go n.store.Store(req.Key, latest.value, latest.timestamp)
-	}
-
-	return &pb.GetResponse{
-		Value:     latest.value,
-		Exists:    latest.exists,
-		Timestamp: latest.timestamp,
-	}, nil
+	return nil, fmt.Errorf("failed to achieve read quorum: got %d, need %d", successCount, readQuorum)
 }
 
 // RingState represents the current state of the consistent hash ring
@@ -591,8 +654,8 @@ func (n *Node) GetRingState(ctx context.Context, req *pb.RingStateRequest) (*pb.
 	return state, nil
 }
 func (n *Node) Stop() {
-    close(n.stopChan)
-    if err := n.store.Shutdown(); err != nil {
-        log.Printf("Error shutting down store: %v", err)
-    }
+	close(n.stopChan)
+	if err := n.store.Shutdown(); err != nil {
+		log.Printf("Error shutting down store: %v", err)
+	}
 }

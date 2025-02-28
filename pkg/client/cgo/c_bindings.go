@@ -9,6 +9,7 @@ import (
 	"unsafe"
 
 	"fmt"
+	"log"
 
 	"Distributed-Key-Value-Store/pkg/client"
 )
@@ -36,7 +37,9 @@ func kv_init(serverList **C.char) C.int {
 
 	// Create new client
 	var err error
-	globalClient, err = client.NewClient(servers)
+	globalClient, err = client.NewClient(servers, &client.ClientConfig{
+		RingUpdateInterval: 30 * time.Second,
+	})
 	if err != nil {
 		return C.int(-1)
 	}
@@ -61,30 +64,34 @@ func kv_shutdown() C.int {
 	return C.int(0)
 }
 
-
 //export kv_get
 func kv_get(key *C.char, value *C.char) C.int {
 	if globalClient == nil {
 		return C.int(-1)
 	}
 
+	// Add ring health check
+	if !globalClient.CheckRingHealth() {
+		return C.int(-2) // New error code for unhealthy ring
+	}
+
 	goKey := C.GoString(key)
 	if err := validateKey(goKey); err != nil {
-		return C.int(-1)
+		return C.int(-3) // New error code for validation failure
 	}
 
 	val, exists, err := globalClient.Get(goKey)
 	if err != nil {
-		return C.int(-1)
+		log.Printf("Get operation failed: %v", err)
+		return C.int(-4) // New error code for operation failure
 	}
 
 	if !exists {
 		return C.int(1)
 	}
 
-	// Safely copy value to C string buffer
 	if len(val) >= 2048 {
-		return C.int(-1)
+		return C.int(-5) // New error code for value too large
 	}
 
 	// Copy with null termination
@@ -95,6 +102,7 @@ func kv_get(key *C.char, value *C.char) C.int {
 
 	return C.int(0)
 }
+
 //export kv_put
 func kv_put(key *C.char, value *C.char, oldValue *C.char) C.int {
 	if globalClient == nil {
