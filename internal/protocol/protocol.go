@@ -2,8 +2,11 @@ package protocol
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -12,18 +15,13 @@ import (
 	"Distributed-Key-Value-Store/pkg/consistenthash"
 
 	"github.com/bits-and-blooms/bloom/v3"
-
-	"fmt"
-	"strconv"
-	"strings"
 )
 
 type Node struct {
 	ID           uint32
 	Store        *storage.Storage
 	logicalClock uint64
-
-	storeMu sync.RWMutex
+	storeMu      sync.RWMutex
 
 	// Node management
 	nodes      map[uint32]string // nodeID -> address
@@ -59,7 +57,7 @@ func NewNode(id uint32, store *storage.Storage, replicationFactor int) *Node {
 		nodes:             make(map[uint32]string),
 		nodeStatus:        make(map[uint32]bool),
 		clients:           make(map[uint32]pb.NodeInternalClient),
-		syncInterval:      5 * time.Minute, //
+		syncInterval:      5 * time.Minute,
 		heartbeatInterval: time.Second,
 		ring:              consistenthash.NewRing(10),
 		ringVersion:       0,
@@ -151,7 +149,7 @@ func (n *Node) performAntiEntropy() {
 	filter := bloom.NewWithEstimates(100000, 0.01) // Size and false positive rate
 	keyTimestamps := make(map[string]uint64)
 
-	// Add local keys to filter
+	// Add local keys to filter and timestamps
 	n.storeMu.RLock()
 	for _, key := range n.Store.GetKeys() {
 		filter.Add([]byte(key))
@@ -160,6 +158,9 @@ func (n *Node) performAntiEntropy() {
 	}
 	n.storeMu.RUnlock()
 
+	// Get key ranges for batch processing
+	keyRanges := n.getKeyRanges()
+
 	// Send to each node
 	for nodeID, client := range n.getClients() {
 		if nodeID == n.ID {
@@ -167,30 +168,44 @@ func (n *Node) performAntiEntropy() {
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
-		encoded, err := filter.GobEncode()
-		if err != nil {
-			log.Printf("Failed to encode bloom filter: %v", err)
-			continue
-		}
-		resp, err := client.SyncKeys(ctx, &pb.SyncRequest{
-			KeyTimestamps: keyTimestamps,
-			BloomFilter:   encoded,
-		})
-		cancel()
+		defer cancel() // Ensure cancel is called to prevent context leak
 
-		if err != nil {
-			log.Printf("Anti-entropy with node %d failed: %v", nodeID, err)
-			continue
-		}
-
-		// Apply missing updates
-		n.storeMu.Lock()
-		for key, kv := range resp.Missing {
-			if !filter.Test([]byte(key)) || kv.Timestamp > keyTimestamps[key] {
-				n.Store.Store(key, kv.Value, kv.Timestamp)
+		// Process key ranges in batches
+		for start, end := range keyRanges {
+			// Create a batch of keys to sync
+			batch := make(map[string]uint64)
+			n.storeMu.RLock()
+			for key, ts := range keyTimestamps {
+				if key >= start && key <= end {
+					batch[key] = ts
+				}
 			}
+			n.storeMu.RUnlock()
+
+			// Send the batch to the remote node
+			encoded, err := filter.GobEncode()
+			if err != nil {
+				log.Printf("Failed to encode bloom filter: %v", err)
+				continue
+			}
+			resp, err := client.SyncKeys(ctx, &pb.SyncRequest{
+				KeyTimestamps: batch,
+				BloomFilter:   encoded,
+			})
+			if err != nil {
+				log.Printf("Anti-entropy with node %d failed: %v", nodeID, err)
+				continue
+			}
+
+			// Apply missing updates
+			n.storeMu.Lock()
+			for key, kv := range resp.Missing {
+				if !filter.Test([]byte(key)) || kv.Timestamp > keyTimestamps[key] {
+					n.Store.Store(key, kv.Value, kv.Timestamp)
+				}
+			}
+			n.storeMu.Unlock()
 		}
-		n.storeMu.Unlock()
 	}
 }
 
@@ -338,13 +353,19 @@ func (n *Node) rebalanceRing() {
 
 	// Update the ring with only active nodes
 	n.storeMu.Lock()
-	for nodeID := range n.nodes {
-		n.ring.RemoveNode(fmt.Sprintf("node-%d", nodeID))
-	}
+	defer n.storeMu.Unlock()
+
+	// Add active nodes to the ring first
 	for _, nodeID := range activeNodes {
 		n.ring.AddNode(fmt.Sprintf("node-%d", nodeID))
 	}
-	n.storeMu.Unlock()
+
+	// Remove old nodes from the ring
+	for nodeID := range n.nodes {
+		if !contains(activeNodes, nodeID) { // Only remove nodes that are not active
+			n.ring.RemoveNode(fmt.Sprintf("node-%d", nodeID))
+		}
+	}
 
 	// Rebalance keys
 	keys := n.Store.GetKeys()
@@ -358,47 +379,45 @@ func (n *Node) rebalanceRing() {
 			value, timestamp, exists := n.Store.Get(key)
 			if exists {
 				// Attempt to replicate with retries
-				go func(k, v string, ts uint64, target string) {
-					for retries := 0; retries < 3; retries++ {
-						if err := n.replicateKey(k, v, ts, target); err != nil {
-							log.Printf("Failed to replicate key %s to %s (attempt %d/3): %v",
-								k, target, retries+1, err)
-							time.Sleep(time.Second * time.Duration(retries+1))
-							continue
-						}
-						return
+				success := false
+				for retries := 0; retries < 3; retries++ {
+					if err := n.replicateKey(key, string(value), timestamp, newNodeID); err == nil {
+						success = true
+						break
 					}
-				}(key, string(value), timestamp, newNodeID)
+					log.Printf("Failed to replicate key %s to %s (attempt %d/3)", key, newNodeID, retries+1)
+					time.Sleep(time.Second * time.Duration(1<<retries)) // Exponential backoff
+				}
+				if !success {
+					// If all retries fail, log the error
+					log.Printf("All attempts to replicate key %s to %s failed. Key may remain un-replicated.", key, newNodeID)
+					// Optionally, you can implement a notification mechanism here
+				}
 			}
 		}
 	}
 }
 
 // replicateKey handles the replication of a single key to a target node
-func (n *Node) replicateKey(key, value string, timestamp uint64, targetNode string) error {
-	// Extract node ID from target node string
-	targetID, err := strconv.ParseUint(strings.TrimPrefix(targetNode, "node-"), 10, 32)
+func (n *Node) replicateKey(key string, value string, timestamp uint64, targetNode string) error {
+	nodeID, err := strconv.ParseUint(strings.TrimPrefix(targetNode, "node-"), 10, 32)
 	if err != nil {
-		return fmt.Errorf("invalid target node format: %v", err)
+		return err
 	}
 
-	// Get client for target node
-	client, ok := n.clients[uint32(targetID)]
-	if !ok {
-		return fmt.Errorf("no client found for node %d", targetID)
+	client, exists := n.clients[uint32(nodeID)]
+	if !exists {
+		return fmt.Errorf("client for node %s does not exist", targetNode)
 	}
 
-	// Send replication request
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
 	defer cancel()
 
-	req := &pb.ReplicateRequest{
+	_, err = client.Replicate(ctx, &pb.ReplicateRequest{
 		Key:       key,
 		Value:     value,
 		Timestamp: timestamp,
-	}
-
-	_, err = client.Replicate(ctx, req)
+	})
 	return err
 }
 
@@ -454,65 +473,72 @@ func (n *Node) IsPrimary(key string) bool {
 }
 
 func (n *Node) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
-    writeQuorum := (n.replicationFactor / 2) + 1
-    successCount := 1 // Count self as first success
+	writeQuorum := (n.replicationFactor / 2) + 1
+	successCount := 1 // Count self as first success
 
-    timestamp := n.getTimestamp(req.Key)
+	timestamp := n.getTimestamp(req.Key)
 
 	oldValue, _, hadOldValue := n.Store.Get(req.Key)
 	n.Store.Store(req.Key, req.Value, timestamp)
 
-    responses := make(chan error, n.replicationFactor-1)
+	responses := make(chan error, n.replicationFactor-1)
+	var wg sync.WaitGroup         // WaitGroup to wait for all goroutines
+	var replicationErrors []error // Slice to collect replication errors
 
-    hash := n.ring.HashKey(req.Key)
-    currentHash := hash
+	hash := n.ring.HashKey(req.Key)
+	currentHash := hash
 
-    for i := 1; i < n.replicationFactor; i++ {
-        nextNodeID := n.ring.GetNextNode(currentHash)
-        if nextNodeID == "" {
-            break
-        }
+	// Replicate to other nodes
+	for i := 1; i < n.replicationFactor; i++ {
+		nextNodeID := n.ring.GetNextNode(currentHash)
+		if nextNodeID == "" {
+			break
+		}
 
-		nodeID, _ := strconv.ParseUint(nextNodeID, 10, 32)
+		nodeID, _ := strconv.ParseUint(strings.TrimPrefix(nextNodeID, "node-"), 10, 32)
 		if client, exists := n.clients[uint32(nodeID)]; exists {
+			wg.Add(1) // Increment the WaitGroup counter
 			go func(c pb.NodeInternalClient) {
-				replicaReq := &pb.ReplicateRequest{
-                    Key:       req.Key,
-                    Value:     req.Value,
-                    Timestamp: timestamp,
-                }
-                _, err := c.Replicate(ctx, replicaReq)
-                responses <- err
-            }(client)
-        }
-        currentHash = n.ring.HashKey(nextNodeID)
-    }
+				defer wg.Done() // Decrement the counter when the goroutine completes
+				_, err := c.Replicate(ctx, &pb.ReplicateRequest{
+					Key:       req.Key,
+					Value:     req.Value,
+					Timestamp: timestamp,
+				})
+				responses <- err
+			}(client)
+		}
+		currentHash = n.ring.HashKey(nextNodeID)
+	}
 
-    for i := 1; i < n.replicationFactor; i++ {
-        select {
-        case err := <-responses:
-            if err == nil {
-                successCount++
-                if successCount >= writeQuorum {
-                    return &pb.PutResponse{
-                        OldValue:    string(oldValue),
-                        HadOldValue: hadOldValue,
-                    }, nil
-                }
-            }
-        case <-ctx.Done():
-            return nil, fmt.Errorf("failed to achieve write quorum: %v", ctx.Err())
-        }
-    }
+	// Close the responses channel in a separate goroutine
+	go func() {
+		wg.Wait()        // Wait for all replication goroutines to finish
+		close(responses) // Close the channel after all responses are sent
+	}()
 
-    if successCount < writeQuorum {
-        return nil, fmt.Errorf("failed to achieve write quorum: got %d, need %d", successCount, writeQuorum)
-    }
+	// Wait for responses and check for quorum
+	for err := range responses {
+		if err == nil {
+			successCount++
+			if successCount >= writeQuorum {
+				// If quorum is reached, we can return early
+				break
+			}
+		} else {
+			replicationErrors = append(replicationErrors, err) // Collect errors
+			log.Printf("Replication error: %v", err)
+		}
+	}
 
-    return &pb.PutResponse{
-        OldValue:    string(oldValue),
-        HadOldValue: hadOldValue,
-    }, nil
+	if successCount < writeQuorum {
+		return nil, fmt.Errorf("failed to achieve write quorum: got %d, need %d. Errors: %v", successCount, writeQuorum, replicationErrors)
+	}
+
+	return &pb.PutResponse{
+		OldValue:    string(oldValue),
+		HadOldValue: hadOldValue,
+	}, nil
 }
 
 // Add a dedicated GetReplica method for more efficient single-key reads
@@ -526,7 +552,7 @@ func (n *Node) GetReplica(ctx context.Context, req *pb.GetReplicaRequest) (*pb.G
 }
 
 // Update Get to use GetReplica
-func (n *Node) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, error) {
+func (n *Node) Get(ctx context.Context, req *pb.GetRequest) (pb.GetResponse, error) {
 	// Use a context with timeout for replica queries
 	replicaCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
@@ -537,7 +563,7 @@ func (n *Node) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, er
 		timestamp uint64
 		exists    bool
 		err       error
-	}, n.replicationFactor)
+	}, n.replicationFactor) // Initially size to replicationFactor
 
 	// Get local value
 	value, timestamp, exists := n.Store.Get(req.Key)
@@ -551,39 +577,32 @@ func (n *Node) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, er
 	// Query replicas using GetReplica
 	hash := n.ring.HashKey(req.Key)
 	currentHash := hash
+	queriedNodes := 1 // Start with the local node
 
 	for i := 1; i < n.replicationFactor; i++ {
 		nextNodeID := n.ring.GetNextNode(currentHash)
 		if nextNodeID == "" {
-			break
+			break // No more nodes available
 		}
 
 		nodeID, _ := strconv.ParseUint(nextNodeID, 10, 32)
 		if client, ok := n.clients[uint32(nodeID)]; ok {
+			queriedNodes++ // Increment the count of queried nodes
 			go func(c pb.NodeInternalClient) {
 				replicaReq := &pb.GetReplicaRequest{Key: req.Key}
 				resp, err := c.GetReplica(replicaCtx, replicaReq)
-				if err != nil {
-					responses <- struct {
-						value     string
-						timestamp uint64
-						exists    bool
-						err       error
-					}{"", 0, false, err}
-					return
-				}
 				responses <- struct {
 					value     string
 					timestamp uint64
 					exists    bool
 					err       error
-				}{resp.Value, resp.Timestamp, resp.Exists, nil}
+				}{resp.Value, resp.Timestamp, resp.Exists, err}
 			}(client)
 		}
 		currentHash = n.ring.HashKey(nextNodeID)
 	}
 
-	// Wait for quorum and find latest value
+	// Wait for responses and find the latest value
 	successCount := 0
 	var latest struct {
 		value     string
@@ -591,7 +610,7 @@ func (n *Node) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, er
 		exists    bool
 	}
 
-	for i := 0; i < n.replicationFactor; i++ {
+	for i := 0; i < queriedNodes; i++ { // Adjust loop to the number of queried nodes
 		select {
 		case resp := <-responses:
 			if resp.err == nil {
@@ -608,19 +627,23 @@ func (n *Node) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, er
 					if latest.exists && latest.timestamp > timestamp {
 						go n.Store.Store(req.Key, latest.value, latest.timestamp)
 					}
-					return &pb.GetResponse{
-						Value:     latest.value,
-						Exists:    latest.exists,
-						Timestamp: latest.timestamp,
-					}, nil
+					break // Exit early if quorum is reached
 				}
 			}
 		case <-ctx.Done():
-			return nil, fmt.Errorf("failed to achieve read quorum: %v", ctx.Err())
+			return pb.GetResponse{}, fmt.Errorf("failed to achieve read quorum: %v", ctx.Err())
 		}
 	}
 
-	return nil, fmt.Errorf("failed to achieve read quorum: got %d, need %d", successCount, readQuorum)
+	if successCount < readQuorum {
+		return pb.GetResponse{}, fmt.Errorf("failed to achieve read quorum: got %d, need %d", successCount, readQuorum)
+	}
+
+	return pb.GetResponse{
+		Value:     latest.value,
+		Exists:    latest.exists,
+		Timestamp: latest.timestamp,
+	}, nil
 }
 
 // RingState represents the current state of the consistent hash ring
@@ -646,9 +669,20 @@ func (n *Node) GetRingState(ctx context.Context, req *pb.RingStateRequest) (*pb.
 
 	return state, nil
 }
+
 func (n *Node) Stop() {
 	close(n.stopChan)
 	if err := n.Store.Shutdown(); err != nil {
 		log.Printf("Error shutting down store: %v", err)
 	}
+}
+
+// contains checks if a slice contains a specific uint32 item
+func contains(slice []uint32, item uint32) bool {
+	for _, v := range slice {
+		if v == item {
+			return true
+		}
+	}
+	return false
 }
