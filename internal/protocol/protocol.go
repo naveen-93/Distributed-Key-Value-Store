@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"Distributed-Key-Value-Store/internal/node"
+	"Distributed-Key-Value-Store/internal/storage"
 	pb "Distributed-Key-Value-Store/kvstore/proto"
 	"Distributed-Key-Value-Store/pkg/consistenthash"
 
@@ -20,7 +20,7 @@ import (
 
 type Node struct {
 	ID           uint32
-	store        *node.Node
+	Store        *storage.Storage
 	logicalClock uint64
 
 	storeMu sync.RWMutex
@@ -52,10 +52,10 @@ type Node struct {
 	lastPhysicalTime int64
 }
 
-func NewNode(id uint32, store *node.Node, replicationFactor int) *Node {
+func NewNode(id uint32, store *storage.Storage, replicationFactor int) *Node {
 	return &Node{
 		ID:                id,
-		store:             store,
+		Store:             store,
 		nodes:             make(map[uint32]string),
 		nodeStatus:        make(map[uint32]bool),
 		clients:           make(map[uint32]pb.NodeInternalClient),
@@ -70,9 +70,9 @@ func NewNode(id uint32, store *node.Node, replicationFactor int) *Node {
 
 // Replicate handles incoming replication requests
 func (n *Node) Replicate(ctx context.Context, req *pb.ReplicateRequest) (*pb.ReplicateResponse, error) {
-	_, timestamp, exists := n.store.Get(req.Key)
+	_, timestamp, exists := n.Store.Get(req.Key)
 	if !exists || (req.Timestamp) > timestamp {
-		n.store.Store(req.Key, req.Value, req.Timestamp)
+		n.Store.Store(req.Key, req.Value, req.Timestamp)
 		return &pb.ReplicateResponse{Success: true}, nil
 	}
 	return &pb.ReplicateResponse{
@@ -96,14 +96,14 @@ func (n *Node) SyncKeys(ctx context.Context, req *pb.SyncRequest) (*pb.SyncRespo
 	// Process key ranges in batches
 	for start, end := range req.KeyRanges {
 		n.storeMu.RLock()
-		keys := n.store.GetKeys()
+		keys := n.Store.GetKeys()
 		n.storeMu.RUnlock()
 
 		for _, key := range keys {
 			if key >= start && key <= end {
 				// Only check keys not in remote filter
 				if !filter.Test([]byte(key)) {
-					value, ts, exists := n.store.Get(key)
+					value, ts, exists := n.Store.Get(key)
 					if exists {
 						missing[key] = &pb.KeyValue{
 							Value:     string(value),
@@ -113,7 +113,7 @@ func (n *Node) SyncKeys(ctx context.Context, req *pb.SyncRequest) (*pb.SyncRespo
 				} else {
 					// Key exists in both, check timestamp
 					if remoteTs, ok := req.KeyTimestamps[key]; ok {
-						value, ts, exists := n.store.Get(key)
+						value, ts, exists := n.Store.Get(key)
 						if exists && ts > remoteTs {
 							missing[key] = &pb.KeyValue{
 								Value:     string(value),
@@ -153,9 +153,9 @@ func (n *Node) performAntiEntropy() {
 
 	// Add local keys to filter
 	n.storeMu.RLock()
-	for _, key := range n.store.GetKeys() {
+	for _, key := range n.Store.GetKeys() {
 		filter.Add([]byte(key))
-		_, ts, _ := n.store.Get(key)
+		_, ts, _ := n.Store.Get(key)
 		keyTimestamps[key] = ts
 	}
 	n.storeMu.RUnlock()
@@ -187,7 +187,7 @@ func (n *Node) performAntiEntropy() {
 		n.storeMu.Lock()
 		for key, kv := range resp.Missing {
 			if !filter.Test([]byte(key)) || kv.Timestamp > keyTimestamps[key] {
-				n.store.Store(key, kv.Value, kv.Timestamp)
+				n.Store.Store(key, kv.Value, kv.Timestamp)
 			}
 		}
 		n.storeMu.Unlock()
@@ -199,8 +199,7 @@ func (n *Node) getKeyRanges() map[string]string {
 	rangeSize := 1000 // Adjust based on your needs
 
 	n.storeMu.RLock()
-	keys := n.store.GetKeys()
-	n.storeMu.RUnlock()
+	keys := n.Store.GetKeys()
 	n.storeMu.RUnlock()
 
 	sort.Strings(keys)
@@ -242,7 +241,7 @@ func (n *Node) getTimestamp(key string) uint64 {
 
 // getLocalTimestamp retrieves the stored timestamp without incrementing
 func (n *Node) getLocalTimestamp(key string) uint64 {
-	_, timestamp, _ := n.store.Get(key)
+	_, timestamp, _ := n.Store.Get(key)
 	return uint64(timestamp)
 }
 
@@ -348,7 +347,7 @@ func (n *Node) rebalanceRing() {
 	n.storeMu.Unlock()
 
 	// Rebalance keys
-	keys := n.store.GetKeys()
+	keys := n.Store.GetKeys()
 	for _, key := range keys {
 		// Calculate the new node for each key
 		hash := n.ring.HashKey(key)
@@ -356,7 +355,7 @@ func (n *Node) rebalanceRing() {
 
 		// If the key should be on a different node, initiate transfer
 		if newNodeID != fmt.Sprintf("node-%d", n.ID) {
-			value, timestamp, exists := n.store.Get(key)
+			value, timestamp, exists := n.Store.Get(key)
 			if exists {
 				// Attempt to replicate with retries
 				go func(k, v string, ts uint64, target string) {
@@ -431,8 +430,8 @@ func (n *Node) replicateToNodes(key string, value string, timestamp uint64) {
 		}
 
 		// Convert node address to ID and send if it's not self
-		nodeID := uint32(n.ring.HashKey(nextNodeID))
-		if client, exists := n.clients[nodeID]; exists {
+		nodeID, _ := strconv.ParseUint(nextNodeID, 10, 32)
+		if client, exists := n.clients[uint32(nodeID)]; exists {
 			go func(c pb.NodeInternalClient) {
 				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 				defer cancel()
@@ -454,81 +453,71 @@ func (n *Node) IsPrimary(key string) bool {
 	return n.ID == hash
 }
 
-// Put handles incoming write requests with quorum enforcement
 func (n *Node) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
-	// Calculate required quorum
-	writeQuorum := (n.replicationFactor / 2) + 1
-	successCount := 1 // Count self as first success
+    writeQuorum := (n.replicationFactor / 2) + 1
+    successCount := 1 // Count self as first success
 
-	// Generate timestamp for this write
-	timestamp := n.getTimestamp(req.Key)
+    timestamp := n.getTimestamp(req.Key)
 
-	// Store locally
-	oldValue, _, hadOldValue := n.store.Get(req.Key)
-	n.store.Store(req.Key, req.Value, timestamp)
+	oldValue, _, hadOldValue := n.Store.Get(req.Key)
+	n.Store.Store(req.Key, req.Value, timestamp)
 
-	// Replicate to other nodes and wait for quorum
-	responses := make(chan error, n.replicationFactor-1)
+    responses := make(chan error, n.replicationFactor-1)
 
-	// Get replica nodes using consistent hashing
-	hash := n.ring.HashKey(req.Key)
-	currentHash := hash
+    hash := n.ring.HashKey(req.Key)
+    currentHash := hash
 
-	// Send to next nodes in the ring
-	for i := 1; i < n.replicationFactor; i++ {
-		// Get next node in ring
-		nextNodeID := n.ring.GetNextNode(currentHash)
-		if nextNodeID == "" {
-			break // No more nodes available
-		}
+    for i := 1; i < n.replicationFactor; i++ {
+        nextNodeID := n.ring.GetNextNode(currentHash)
+        if nextNodeID == "" {
+            break
+        }
 
-		// Convert node ID format to uint32
-		nodeID := uint32(n.ring.HashKey(nextNodeID))
-		if client, exists := n.clients[nodeID]; exists {
+		nodeID, _ := strconv.ParseUint(nextNodeID, 10, 32)
+		if client, exists := n.clients[uint32(nodeID)]; exists {
 			go func(c pb.NodeInternalClient) {
 				replicaReq := &pb.ReplicateRequest{
-					Key:       req.Key,
-					Value:     req.Value,
-					Timestamp: timestamp,
-				}
-				_, err := c.Replicate(ctx, replicaReq)
-				responses <- err
-			}(client)
-		}
-		currentHash = n.ring.HashKey(nextNodeID)
-	}
+                    Key:       req.Key,
+                    Value:     req.Value,
+                    Timestamp: timestamp,
+                }
+                _, err := c.Replicate(ctx, replicaReq)
+                responses <- err
+            }(client)
+        }
+        currentHash = n.ring.HashKey(nextNodeID)
+    }
 
-	// Wait for quorum
-	for i := 1; i < n.replicationFactor; i++ {
-		select {
-		case err := <-responses:
-			if err == nil {
-				successCount++
-				if successCount >= writeQuorum {
-					return &pb.PutResponse{
-						OldValue:    string(oldValue),
-						HadOldValue: hadOldValue,
-					}, nil
-				}
-			}
-		case <-ctx.Done():
-			return nil, fmt.Errorf("failed to achieve write quorum: %v", ctx.Err())
-		}
-	}
+    for i := 1; i < n.replicationFactor; i++ {
+        select {
+        case err := <-responses:
+            if err == nil {
+                successCount++
+                if successCount >= writeQuorum {
+                    return &pb.PutResponse{
+                        OldValue:    string(oldValue),
+                        HadOldValue: hadOldValue,
+                    }, nil
+                }
+            }
+        case <-ctx.Done():
+            return nil, fmt.Errorf("failed to achieve write quorum: %v", ctx.Err())
+        }
+    }
 
-	if successCount < writeQuorum {
-		return nil, fmt.Errorf("failed to achieve write quorum: got %d, need %d", successCount, writeQuorum)
-	}
+    if successCount < writeQuorum {
+        return nil, fmt.Errorf("failed to achieve write quorum: got %d, need %d", successCount, writeQuorum)
+    }
 
-	return &pb.PutResponse{
-		OldValue:    string(oldValue),
-		HadOldValue: hadOldValue,
-	}, nil
+    return &pb.PutResponse{
+        OldValue:    string(oldValue),
+        HadOldValue: hadOldValue,
+    }, nil
 }
 
 // Add a dedicated GetReplica method for more efficient single-key reads
 func (n *Node) GetReplica(ctx context.Context, req *pb.GetReplicaRequest) (*pb.GetReplicaResponse, error) {
-	value, timestamp, exists := n.store.Get(req.Key)
+	value, timestamp, exists := n.Store.Get(req.Key)
 	return &pb.GetReplicaResponse{
 		Value:     string(value),
 		Timestamp: uint64(timestamp),
@@ -538,6 +527,10 @@ func (n *Node) GetReplica(ctx context.Context, req *pb.GetReplicaRequest) (*pb.G
 
 // Update Get to use GetReplica
 func (n *Node) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, error) {
+	// Use a context with timeout for replica queries
+	replicaCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
 	readQuorum := (n.replicationFactor / 2) + 1
 	responses := make(chan struct {
 		value     string
@@ -547,7 +540,7 @@ func (n *Node) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, er
 	}, n.replicationFactor)
 
 	// Get local value
-	value, timestamp, exists := n.store.Get(req.Key)
+	value, timestamp, exists := n.Store.Get(req.Key)
 	responses <- struct {
 		value     string
 		timestamp uint64
@@ -565,11 +558,11 @@ func (n *Node) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, er
 			break
 		}
 
-		nodeID := uint32(n.ring.HashKey(nextNodeID))
-		if client, ok := n.clients[nodeID]; ok {
+		nodeID, _ := strconv.ParseUint(nextNodeID, 10, 32)
+		if client, ok := n.clients[uint32(nodeID)]; ok {
 			go func(c pb.NodeInternalClient) {
 				replicaReq := &pb.GetReplicaRequest{Key: req.Key}
-				resp, err := c.GetReplica(ctx, replicaReq)
+				resp, err := c.GetReplica(replicaCtx, replicaReq)
 				if err != nil {
 					responses <- struct {
 						value     string
@@ -613,7 +606,7 @@ func (n *Node) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, er
 				if successCount >= readQuorum {
 					// Perform read repair if needed
 					if latest.exists && latest.timestamp > timestamp {
-						go n.store.Store(req.Key, latest.value, latest.timestamp)
+						go n.Store.Store(req.Key, latest.value, latest.timestamp)
 					}
 					return &pb.GetResponse{
 						Value:     latest.value,
@@ -655,7 +648,7 @@ func (n *Node) GetRingState(ctx context.Context, req *pb.RingStateRequest) (*pb.
 }
 func (n *Node) Stop() {
 	close(n.stopChan)
-	if err := n.store.Shutdown(); err != nil {
+	if err := n.Store.Shutdown(); err != nil {
 		log.Printf("Error shutting down store: %v", err)
 	}
 }
