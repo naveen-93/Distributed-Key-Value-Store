@@ -154,11 +154,16 @@ func (r *Ring) GetNextNode(hash uint32) string {
 	return r.mapping[r.hashRing[idx]]
 }
 
-// HashKey generates a hash for a string using MurmurHash3
-func (r *Ring) HashKey(s string) uint32 {
-	r.hashFunc.Reset()
-	r.hashFunc.Write([]byte(s))
-	return r.hashFunc.Sum32()
+// HashKey hashes a key to a position on the ring
+func (r *Ring) HashKey(key string) uint32 {
+	// Handle empty keys to prevent nil pointer dereference
+	if key == "" {
+		return 0
+	}
+
+	h := murmur3.New32()
+	h.Write([]byte(key))
+	return h.Sum32()
 }
 
 // DisplayRing prints the hash ring for debugging

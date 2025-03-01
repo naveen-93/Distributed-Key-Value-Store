@@ -19,7 +19,7 @@ typedef struct { const char *p; ptrdiff_t n; } _GoString_;
 /* Start of preamble from import "C" comments.  */
 
 
-#line 3 "libkv.go"
+#line 634 "main.go"
  #include <stdlib.h>
  #include <string.h>
 
@@ -79,10 +79,7 @@ typedef struct { void *data; GoInt len; GoInt cap; } GoSlice;
 extern "C" {
 #endif
 
-extern int kv_init(char** serverList);
-extern int kv_shutdown();
-extern int kv_get(char* key, char* value);
-extern int kv_put(char* key, char* value, char* oldValue);
+extern int kv_get(char* cKey, char* cValue);
 
 #ifdef __cplusplus
 }

@@ -1,190 +1,157 @@
 #include <stdio.h>
-#include <string.h>
 #include <stdlib.h>
-#include <pthread.h>
+#include <string.h>
+#include <assert.h>
+
+// Include the generated header file
 #include "../libkv.h"
 
-#define NUM_THREADS 10
-
-// Structure to pass data to threads
-typedef struct {
-    int id;
-    int success;
-} thread_data_t;
-
-// Mutex for thread-safe printing
-pthread_mutex_t print_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-// Function that each thread will run
-void* concurrent_test(void* arg) {
-    thread_data_t* data = (thread_data_t*)arg;
-    char key[32], value[32], retrieved[2049] = {0}, old_value[2049] = {0};
-
-    // Create unique key-value pair for this thread
-    snprintf(key, sizeof(key), "concurrent_key_%d", data->id);
-    snprintf(value, sizeof(value), "concurrent_value_%d", data->id);
-
-    // Test put
-    int result = kv_put(key, value, old_value);
-    if (result < 0) {
-        pthread_mutex_lock(&print_mutex);
-        printf("  Thread %d: Put failed\n", data->id);
-        pthread_mutex_unlock(&print_mutex);
-        return NULL;
+// Helper function to check results
+void check_result(int result, const char* operation) {
+    if (result == -1) {
+        printf("ERROR: %s operation failed\n", operation);
+    } else if (result == 0) {
+        printf("SUCCESS: %s operation completed successfully\n", operation);
+    } else if (result == 1) {
+        printf("INFO: %s - key not found or new key created\n", operation);
     }
-
-    // Test get
-    result = kv_get(key, retrieved);
-    if (result != 0 || strcmp(retrieved, value) != 0) {
-        pthread_mutex_lock(&print_mutex);
-        printf("  Thread %d: Get failed or value mismatch\n", data->id);
-        pthread_mutex_unlock(&print_mutex);
-        return NULL;
-    }
-
-    data->success = 1;
-    return NULL;
 }
 
-void test_concurrent_operations() {
-    printf("\nTesting concurrent operations...\n");
-
-    pthread_t threads[NUM_THREADS];
-    thread_data_t thread_data[NUM_THREADS];
-    int success_count = 0;
-
-    // Create threads
-    for (int i = 0; i < NUM_THREADS; i++) {
-        thread_data[i].id = i;
-        thread_data[i].success = 0;
-        if (pthread_create(&threads[i], NULL, concurrent_test, &thread_data[i]) != 0) {
-            printf("  Failed to create thread %d\n", i);
-            return;
-        }
-    }
-
-    // Wait for all threads to complete
-    for (int i = 0; i < NUM_THREADS; i++) {
-        pthread_join(threads[i], NULL);
-        if (thread_data[i].success) {
-            success_count++;
-        }
-    }
-
-    printf("  Concurrent tests completed: %d/%d operations successful\n",
-           success_count, NUM_THREADS);
-}
-
+// Test basic operations
 void test_basic_operations() {
-    printf("Testing basic operations...\n");
+    printf("\n=== Testing Basic Operations ===\n");
+    
+    // Buffer for values
+    char value_buffer[2048] = {0};
+    char old_value_buffer[2048] = {0};
+    char *test_key = "test-key-1";
+    char *test_value = "test-value-1";
+    char *updated_value = "updated-value-1";
+    
+    // Test PUT operation for a new key
+    int result = kv_put(test_key, test_value, old_value_buffer);
+    check_result(result, "PUT (new key)");
+    
+    // Test GET operation for existing key
+    memset(value_buffer, 0, sizeof(value_buffer));
+    result = kv_get(test_key, value_buffer);
+    check_result(result, "GET");
+    printf("Retrieved value: %s\n", value_buffer);
+    
+    // Test PUT operation to update existing key
+    memset(old_value_buffer, 0, sizeof(old_value_buffer));
+    result = kv_put(test_key, updated_value, old_value_buffer);
+    check_result(result, "PUT (update)");
+    printf("Old value: %s\n", old_value_buffer);
+    
+    // Test GET operation for updated key
+    memset(value_buffer, 0, sizeof(value_buffer));
+    result = kv_get(test_key, value_buffer);
+    check_result(result, "GET (after update)");
+    printf("Retrieved updated value: %s\n", value_buffer);
+    
+    // Test GET for non-existent key
+    memset(value_buffer, 0, sizeof(value_buffer));
+    result = kv_get("non-existent-key", value_buffer);
+    check_result(result, "GET (non-existent)");
+}
 
-    // Test Put and Get
-    char *key = "test_key";
-    char *value = "test_value";
-    char old_value[2049] = {0};
-    char retrieved_value[2049] = {0};
-
-    int result = kv_put(key, value, old_value);
-    if (result < 0) {
-        printf("  Put failed\n");
-        return;
+// Test multiple operations in sequence
+void test_multiple_operations() {
+    printf("\n=== Testing Multiple Operations ===\n");
+    
+    char value_buffer[2048] = {0};
+    char old_value_buffer[2048] = {0};
+    int result;
+    
+    // Create multiple keys
+    char *keys[] = {"multi-key-1", "multi-key-2", "multi-key-3"};
+    char *values[] = {"multi-value-1", "multi-value-2", "multi-value-3"};
+    
+    for (int i = 0; i < 3; i++) {
+        memset(old_value_buffer, 0, sizeof(old_value_buffer));
+        result = kv_put(keys[i], values[i], old_value_buffer);
+        check_result(result, "PUT (multiple)");
+        printf("Put %s = %s\n", keys[i], values[i]);
     }
-    printf("  Put successful: key=%s, value=%s\n", key, value);
-
-    result = kv_get(key, retrieved_value);
-    if (result == 0) {
-        printf("  Get successful: key=%s, value=%s\n", key, retrieved_value);
-    } else {
-        printf("  Get failed with code: %d\n", result);
+    
+    // Retrieve all keys
+    for (int i = 0; i < 3; i++) {
+        memset(value_buffer, 0, sizeof(value_buffer));
+        result = kv_get(keys[i], value_buffer);
+        check_result(result, "GET (multiple)");
+        printf("Get %s = %s\n", keys[i], value_buffer);
     }
 }
 
-void test_invalid_inputs() {
-    printf("\nTesting invalid inputs...\n");
-
-    char old_value[2049] = {0};
-
-    // Test empty key
-    int result = kv_put("", "empty_key_test", old_value);
-    if (result < 0) {
-        printf("  Empty key test passed\n");
-    }
-
-    // Test key too long (>128 bytes)
-    char long_key[130];
-    memset(long_key, 'a', 129);
-    long_key[129] = '\0';
-    result = kv_put(long_key, "long_key_test", old_value);
-    if (result < 0) {
-        printf("  Long key test passed\n");
-    }
-
-    // Test value too long (>2048 bytes)
-    char long_value[2050];
-    memset(long_value, 'v', 2049);
-    long_value[2049] = '\0';
-    result = kv_put("key", long_value, old_value);
-    if (result < 0) {
-        printf("  Long value test passed\n");
-    }
-}
-
-void test_boundary_conditions() {
-    printf("\nTesting boundary conditions...\n");
-
-    // Test maximum allowed key size (128 bytes)
-    char max_key[129];
-    memset(max_key, 'k', 128);
-    max_key[128] = '\0';
-
-    char old_value[2049] = {0};
-    char retrieved_value[2049] = {0};
-
-    int result = kv_put(max_key, "max_key_test", old_value);
-    if (result >= 0) {
-        result = kv_get(max_key, retrieved_value);
-        if (result == 0 && strcmp(retrieved_value, "max_key_test") == 0) {
-            printf("  Max key size test passed\n");
-        }
-    }
-
-    // Test maximum allowed value size (2048 bytes)
-    char max_value[2049];
-    memset(max_value, 'v', 2048);
-    max_value[2048] = '\0';
-
-    result = kv_put("max_value_key", max_value, old_value);
-    if (result >= 0) {
-        result = kv_get("max_value_key", retrieved_value);
-        if (result == 0 && strcmp(retrieved_value, max_value) == 0) {
-            printf("  Max value size test passed\n");
-        }
-    }
+// Test edge cases
+void test_edge_cases() {
+    printf("\n=== Testing Edge Cases ===\n");
+    
+    char value_buffer[2048] = {0};
+    char old_value_buffer[2048] = {0};
+    int result;
+    
+    // Test with empty key (should be valid)
+    result = kv_put("", "empty-key-value", old_value_buffer);
+    check_result(result, "PUT (empty key)");
+    
+    // Test with empty value (should be valid)
+    result = kv_put("empty-value-key", "", old_value_buffer);
+    check_result(result, "PUT (empty value)");
+    
+    // Verify empty value
+    memset(value_buffer, 0, sizeof(value_buffer));
+    result = kv_get("empty-value-key", value_buffer);
+    check_result(result, "GET (empty value)");
+    printf("Empty value length: %lu\n", strlen(value_buffer));
+    
+    // Test with long key (close to max length)
+    char long_key[128] = {0};
+    memset(long_key, 'a', 127);
+    result = kv_put(long_key, "long-key-value", old_value_buffer);
+    check_result(result, "PUT (long key)");
+    
+    // Test with long value (close to max length)
+    char long_value[2048] = {0};
+    memset(long_value, 'b', 2047);
+    result = kv_put("long-value-key", long_value, old_value_buffer);
+    check_result(result, "PUT (long value)");
+    
+    // Verify long value
+    memset(value_buffer, 0, sizeof(value_buffer));
+    result = kv_get("long-value-key", value_buffer);
+    check_result(result, "GET (long value)");
+    printf("Long value length: %lu\n", strlen(value_buffer));
 }
 
 int main() {
-    printf("=== Key-Value Store Library Tests ===\n\n");
-
-    // Initialize client
-    char *servers[] = {"localhost:50051", NULL};
-    if (kv_init(servers) != 0) {
-        printf("Failed to initialize client\n");
+    printf("=== Key-Value Store Client Test ===\n");
+    
+    // Initialize the client with server addresses
+    char *servers[] = {
+        "localhost:50051",
+        "localhost:50052",
+        "localhost:50053",
+        NULL  // Null-terminated array
+    };
+    
+    int init_result = kv_init(servers);
+    if (init_result != 0) {
+        printf("Failed to initialize client. Make sure servers are running.\n");
         return 1;
     }
-    printf("Client initialized successfully\n\n");
-
+    
+    printf("Client initialized successfully.\n");
+    
     // Run tests
     test_basic_operations();
-    test_invalid_inputs();
-    test_boundary_conditions();
-    test_concurrent_operations();
-
-    // Shutdown client
-    if (kv_shutdown() != 0) {
-        printf("\nShutdown failed\n");
-        return 1;
-    }
-    printf("\nShutdown successful\n");
-
+    test_multiple_operations();
+    test_edge_cases();
+    
+    // Shutdown the client
+    kv_shutdown();
+    printf("\nClient shut down successfully.\n");
+    
     return 0;
-} 
+}

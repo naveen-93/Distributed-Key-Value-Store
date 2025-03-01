@@ -1,20 +1,51 @@
-package main
+package client
 
 import (
-	"bufio"
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
-	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	pb "Distributed-Key-Value-Store/kvstore/proto"
+	"Distributed-Key-Value-Store/pkg/consistenthash"
+
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 )
+
+const (
+	maxKeyLength   = 128
+	maxValueLength = 2048
+)
+
+func validateKey(key string) error {
+	if len(key) > maxKeyLength {
+		return fmt.Errorf("key exceeds %d bytes", maxKeyLength)
+	}
+	for _, r := range key {
+		if r < 32 || r > 126 {
+			return fmt.Errorf("invalid character in key: %q", r)
+		}
+	}
+	return nil
+}
+
+func validateValue(value string) error {
+	if len(value) > maxValueLength {
+		return fmt.Errorf("value exceeds %d bytes", maxValueLength)
+	}
+	for _, r := range value {
+		if r < 32 || r > 126 {
+			return fmt.Errorf("invalid character in value: %q", r)
+		}
+	}
+	return nil
+}
 
 type ClientConfig struct {
 	ServerAddresses []string
@@ -24,10 +55,21 @@ type ClientConfig struct {
 }
 
 type Client struct {
-	config  ClientConfig
-	conn    *grpc.ClientConn
-	client  pb.KVStoreClient
-	current int // Current server index
+	config         ClientConfig
+	connections    map[string]*grpc.ClientConn
+	clients        map[string]pb.KVStoreClient
+	mu             sync.RWMutex
+	current        int    // Current server index
+	requestCounter uint64 // For round-robin load balancing
+
+	// Cluster awareness fields
+	ring              *consistenthash.Ring
+	nodeAddresses     map[string]string // Maps nodeID to address
+	replicationFactor int
+	ringVersion       uint64
+	ringMu            sync.RWMutex
+	ctx               context.Context    // Add context
+	cancel            context.CancelFunc // Add cancel function
 }
 
 func NewClient(config ClientConfig) (*Client, error) {
@@ -35,7 +77,6 @@ func NewClient(config ClientConfig) (*Client, error) {
 		return nil, fmt.Errorf("no server addresses provided")
 	}
 
-	// Set defaults if not specified
 	if config.Timeout == 0 {
 		config.Timeout = 5 * time.Second
 	}
@@ -46,454 +87,619 @@ func NewClient(config ClientConfig) (*Client, error) {
 		config.RetryDelay = 500 * time.Millisecond
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
 	client := &Client{
-		config:  config,
-		current: 0,
+		config:            config,
+		current:           0,
+		connections:       make(map[string]*grpc.ClientConn),
+		clients:           make(map[string]pb.KVStoreClient),
+		requestCounter:    0,
+		ring:              consistenthash.NewRing(10),
+		nodeAddresses:     make(map[string]string),
+		replicationFactor: 3,
+		ctx:               ctx,
+		cancel:            cancel,
 	}
 
-	// Connect to the first available server
-	err := client.connect()
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to any server: %v", err)
+	for _, addr := range config.ServerAddresses {
+		if err := client.connectToServer(addr); err != nil {
+			log.Printf("Failed to connect to %s: %v", addr, err)
+		}
 	}
 
+	if len(client.clients) == 0 {
+		return nil, fmt.Errorf("failed to connect to any server")
+	}
+
+	if err := client.updateRingState(); err != nil {
+		log.Printf("Warning: Failed to fetch initial ring state: %v", err)
+	}
+
+	go client.ringStateUpdater()
 	return client, nil
 }
 
-func (c *Client) connect() error {
-	// Try each server in the list
-	for i := 0; i < len(c.config.ServerAddresses); i++ {
-		idx := (c.current + i) % len(c.config.ServerAddresses)
-		addr := c.config.ServerAddresses[idx]
+func (c *Client) connectToServer(addr string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-		// Close existing connection if any
-		if c.conn != nil {
-			c.conn.Close()
-		}
-
-		// Try to connect
-		ctx, cancel := context.WithTimeout(context.Background(), c.config.Timeout)
-		defer cancel()
-
-		conn, err := grpc.DialContext(
-			ctx,
-			addr,
-			grpc.WithTransportCredentials(insecure.NewCredentials()),
-			grpc.WithBlock(),
-		)
-		if err != nil {
-			log.Printf("Failed to connect to %s: %v", addr, err)
-			continue
-		}
-
-		c.conn = conn
-		c.client = pb.NewKVStoreClient(conn)
-		c.current = idx
-		log.Printf("Connected to server at %s", addr)
+	// Check if we're already connected
+	if _, exists := c.connections[addr]; exists {
 		return nil
 	}
 
-	return fmt.Errorf("failed to connect to any server")
+	// Try to connect
+	ctx, cancel := context.WithTimeout(context.Background(), c.config.Timeout)
+	defer cancel()
+
+	conn, err := grpc.DialContext(
+		ctx,
+		addr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithBlock(),
+	)
+	if err != nil {
+		return err
+	}
+
+	c.connections[addr] = conn
+	c.clients[addr] = pb.NewKVStoreClient(conn)
+	log.Printf("Connected to server at %s", addr)
+	return nil
 }
 
 func (c *Client) Close() {
-	if c.conn != nil {
-		c.conn.Close()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.cancel() // Stop the background goroutine
+
+	for addr, conn := range c.connections {
+		if err := conn.Close(); err != nil {
+			log.Printf("Error closing connection to %s: %v", addr, err)
+		}
 	}
+
+	c.connections = make(map[string]*grpc.ClientConn)
+	c.clients = make(map[string]pb.KVStoreClient)
 }
 
-func (c *Client) Get(key string) (string, uint64, bool, error) {
-	for attempt := 0; attempt < c.config.RetryAttempts; attempt++ {
-		ctx, cancel := context.WithTimeout(context.Background(), c.config.Timeout)
-		resp, err := c.client.Get(ctx, &pb.GetRequest{Key: key})
+// Get retrieves a value with load balancing and automatic failover
+func (c *Client) Get(ctx context.Context, key string) (string, uint64, bool, error) {
+	if err := validateKey(key); err != nil {
+		return "", 0, false, err
+	}
+
+	// Try to use ring-aware routing first
+	value, timestamp, exists, err := c.ringAwareGet(ctx, key)
+	if err == nil {
+		return value, timestamp, exists, nil
+	}
+
+	// Fall back to querying all servers if ring-aware routing fails
+	log.Printf("Ring-aware routing failed: %v, falling back to querying all servers", err)
+	return c.fallbackGet(ctx, key)
+}
+
+// Add ring-aware Get implementation
+func (c *Client) ringAwareGet(ctx context.Context, key string) (string, uint64, bool, error) {
+	c.ringMu.RLock()
+	if c.ring == nil || len(c.nodeAddresses) == 0 {
+		c.ringMu.RUnlock()
+		return "", 0, false, fmt.Errorf("ring state not available")
+	}
+
+	// Get replicas for this key
+	replicas := c.ring.GetReplicas(key, c.replicationFactor)
+	c.ringMu.RUnlock()
+
+	if len(replicas) == 0 {
+		return "", 0, false, fmt.Errorf("no replicas found for key")
+	}
+
+	// Create context with timeout
+	ctx, cancel := context.WithTimeout(ctx, c.config.Timeout)
+	defer cancel()
+
+	// Query replicas in parallel
+	type result struct {
+		value     string
+		timestamp uint64
+		exists    bool
+		err       error
+		server    string
+	}
+
+	resultChan := make(chan result, len(replicas))
+	queriedAddresses := make(map[string]bool)
+
+	// Launch parallel requests to replica nodes
+	for _, nodeID := range replicas {
+		c.ringMu.RLock()
+		addr, ok := c.nodeAddresses[nodeID]
+		c.ringMu.RUnlock()
+
+		if !ok {
+			log.Printf("No address found for node %s", nodeID)
+			continue
+		}
+
+		// Skip if we've already queried this address
+		if queriedAddresses[addr] {
+			continue
+		}
+		queriedAddresses[addr] = true
+
+		go func(serverAddr string) {
+			c.mu.RLock()
+			client, ok := c.clients[serverAddr]
+			c.mu.RUnlock()
+
+			if !ok {
+				resultChan <- result{err: fmt.Errorf("no client for server %s", serverAddr), server: serverAddr}
+				return
+			}
+
+			resp, err := client.Get(ctx, &pb.GetRequest{Key: key})
+			if err != nil {
+				resultChan <- result{err: err, server: serverAddr}
+				return
+			}
+
+			resultChan <- result{
+				value:     resp.Value,
+				timestamp: resp.Timestamp,
+				exists:    resp.Exists,
+				server:    serverAddr,
+			}
+		}(addr)
+	}
+
+	// Process results
+	var mostRecentValue string
+	var mostRecentTimestamp uint64
+	var mostRecentExists bool
+	var mostRecentServer string
+	var successCount int
+	var lastErr error
+
+	// Wait for all responses or timeout
+	for i := 0; i < len(queriedAddresses); i++ {
+		select {
+		case res := <-resultChan:
+			if res.err != nil {
+				lastErr = res.err
+				log.Printf("Error from server %s: %v", res.server, res.err)
+
+				// Try to reconnect in background if it's a connection error
+				s, ok := status.FromError(res.err)
+				if ok && (s.Code() == codes.Unavailable || s.Code() == codes.DeadlineExceeded) {
+					go func(address string) {
+						if err := c.connectToServer(address); err != nil {
+							log.Printf("Failed to reconnect to %s: %v", address, err)
+						}
+					}(res.server)
+				}
+				continue
+			}
+
+			successCount++
+
+			// If this server has the key and it's newer than what we've seen so far
+			if res.exists && (mostRecentTimestamp == 0 || res.timestamp > mostRecentTimestamp) {
+				mostRecentValue = res.value
+				mostRecentTimestamp = res.timestamp
+				mostRecentExists = true
+				mostRecentServer = res.server
+			}
+
+		case <-ctx.Done():
+			// Timeout occurred
+			if successCount == 0 {
+				return "", 0, false, fmt.Errorf("all replica servers timed out")
+			}
+			// Break out of the loop if we've got at least one response
+			i = len(queriedAddresses)
+		}
+	}
+
+	// If we found the key on at least one server
+	if mostRecentExists {
+		// Update current server index for UI display
+		c.mu.RLock()
+		addresses := make([]string, 0, len(c.clients))
+		for addr := range c.clients {
+			addresses = append(addresses, addr)
+		}
+		c.mu.RUnlock()
+
+		for i, addr := range addresses {
+			if addr == mostRecentServer {
+				c.current = i
+				break
+			}
+		}
+		return mostRecentValue, mostRecentTimestamp, true, nil
+	}
+
+	// If we got responses but no server had the key
+	if successCount > 0 {
+		return "", 0, false, nil
+	}
+
+	// All servers failed
+	return "", 0, false, fmt.Errorf("all replica servers failed: %v", lastErr)
+}
+
+// Add fallback Get implementation (existing implementation)
+func (c *Client) fallbackGet(ctx context.Context, key string) (string, uint64, bool, error) {
+	c.mu.RLock()
+	addresses := make([]string, 0, len(c.clients))
+	for addr := range c.clients {
+		addresses = append(addresses, addr)
+	}
+	c.mu.RUnlock()
+
+	if len(addresses) == 0 {
+		return "", 0, false, fmt.Errorf("no available servers")
+	}
+
+	// Query all servers in parallel
+	ctx, cancel := context.WithTimeout(ctx, c.config.Timeout)
+	defer cancel()
+
+	type result struct {
+		value     string
+		timestamp uint64
+		exists    bool
+		err       error
+		server    string
+	}
+
+	resultChan := make(chan result, len(addresses))
+
+	// Launch parallel requests to all servers
+	for _, addr := range addresses {
+		go func(serverAddr string) {
+			c.mu.RLock()
+			client, ok := c.clients[serverAddr]
+			c.mu.RUnlock()
+
+			if !ok {
+				resultChan <- result{err: fmt.Errorf("no client for server %s", serverAddr), server: serverAddr}
+				return
+			}
+
+			resp, err := client.Get(ctx, &pb.GetRequest{Key: key})
+			if err != nil {
+				resultChan <- result{err: err, server: serverAddr}
+				return
+			}
+
+			resultChan <- result{
+				value:     resp.Value,
+				timestamp: resp.Timestamp,
+				exists:    resp.Exists,
+				server:    serverAddr,
+			}
+		}(addr)
+	}
+
+	// Process results
+	var mostRecentValue string
+	var mostRecentTimestamp uint64
+	var mostRecentExists bool
+	var mostRecentServer string
+	var successCount int
+	var lastErr error
+
+	// Wait for all responses or timeout
+	for i := 0; i < len(addresses); i++ {
+		select {
+		case res := <-resultChan:
+			if res.err != nil {
+				lastErr = res.err
+				log.Printf("Error from server %s: %v", res.server, res.err)
+
+				// Try to reconnect in background if it's a connection error
+				s, ok := status.FromError(res.err)
+				if ok && (s.Code() == codes.Unavailable || s.Code() == codes.DeadlineExceeded) {
+					go func(address string) {
+						if err := c.connectToServer(address); err != nil {
+							log.Printf("Failed to reconnect to %s: %v", address, err)
+						}
+					}(res.server)
+				}
+				continue
+			}
+
+			successCount++
+
+			// If this server has the key and it's newer than what we've seen so far
+			if res.exists && (mostRecentTimestamp == 0 || res.timestamp > mostRecentTimestamp) {
+				mostRecentValue = res.value
+				mostRecentTimestamp = res.timestamp
+				mostRecentExists = true
+				mostRecentServer = res.server
+			}
+
+		case <-ctx.Done():
+			// Timeout occurred
+			if successCount == 0 {
+				return "", 0, false, fmt.Errorf("all servers timed out")
+			}
+			// Break out of the loop if we've got at least one response
+			i = len(addresses)
+		}
+	}
+
+	// If we found the key on at least one server
+	if mostRecentExists {
+		// Update current server index for UI display
+		for i, addr := range addresses {
+			if addr == mostRecentServer {
+				c.current = i
+				break
+			}
+		}
+		return mostRecentValue, mostRecentTimestamp, true, nil
+	}
+
+	// If we got responses but no server had the key
+	if successCount > 0 {
+		return "", 0, false, nil
+	}
+
+	// All servers failed
+	return "", 0, false, fmt.Errorf("all servers failed: %v", lastErr)
+}
+
+// Put stores a value with load balancing and automatic failover
+func (c *Client) Put(ctx context.Context, key, value string) (string, bool, error) {
+	if err := validateKey(key); err != nil {
+		return "", false, err
+	}
+	if err := validateValue(value); err != nil {
+		return "", false, err
+	}
+
+	// Try to use ring-aware routing first
+	oldValue, hadOldValue, err := c.ringAwarePut(ctx, key, value)
+	if err == nil {
+		return oldValue, hadOldValue, nil
+	}
+
+	// Fall back to round-robin if ring-aware routing fails
+	log.Printf("Ring-aware routing failed: %v, falling back to round-robin", err)
+	return c.fallbackPut(ctx, key, value)
+}
+
+// Add ring-aware Put implementation
+func (c *Client) ringAwarePut(ctx context.Context, key, value string) (string, bool, error) {
+	c.ringMu.RLock()
+	if c.ring == nil || len(c.nodeAddresses) == 0 {
+		c.ringMu.RUnlock()
+		return "", false, fmt.Errorf("ring state not available")
+	}
+
+	// Get primary node for this key
+	replicas := c.ring.GetReplicas(key, c.replicationFactor)
+	c.ringMu.RUnlock()
+
+	if len(replicas) == 0 {
+		return "", false, fmt.Errorf("no replicas found for key")
+	}
+
+	// Try each replica in order until success
+	var lastErr error
+	for _, nodeID := range replicas {
+		c.ringMu.RLock()
+		addr, ok := c.nodeAddresses[nodeID]
+		c.ringMu.RUnlock()
+
+		if !ok {
+			log.Printf("No address found for node %s", nodeID)
+			continue
+		}
+
+		c.mu.RLock()
+		client, ok := c.clients[addr]
+		c.mu.RUnlock()
+
+		if !ok {
+			log.Printf("No client for server %s", addr)
+			continue
+		}
+
+		ctx, cancel := context.WithTimeout(ctx, c.config.Timeout)
+		resp, err := client.Put(ctx, &pb.PutRequest{Key: key, Value: value})
 		cancel()
 
 		if err == nil {
-			return resp.Value, resp.Timestamp, resp.Exists, nil
-		}
+			// Success - update current server index for UI display
+			c.mu.RLock()
+			addresses := make([]string, 0, len(c.clients))
+			for a := range c.clients {
+				addresses = append(addresses, a)
+			}
+			c.mu.RUnlock()
 
-		s, ok := status.FromError(err)
-		if !ok || (s.Code() != 14 && s.Code() != 4) { // Not unavailable or deadline exceeded
-			return "", 0, false, err
-		}
-
-		log.Printf("Server connection error (attempt %d/%d): %v", 
-			attempt+1, c.config.RetryAttempts, err)
-		
-		// Try to reconnect
-		if connectErr := c.connect(); connectErr != nil {
-			log.Printf("Reconnect failed: %v", connectErr)
-		}
-
-		time.Sleep(c.config.RetryDelay)
-	}
-
-	return "", 0, false, fmt.Errorf("failed after %d attempts", c.config.RetryAttempts)
-}
-
-func (c *Client) Put(key, value string) (string, bool, error) {
-	for attempt := 0; attempt < c.config.RetryAttempts; attempt++ {
-		ctx, cancel := context.WithTimeout(context.Background(), c.config.Timeout)
-		resp, err := c.client.Put(ctx, &pb.PutRequest{Key: key, Value: value})
-		cancel()
-
-		if err == nil {
+			for i, a := range addresses {
+				if a == addr {
+					c.current = i
+					break
+				}
+			}
 			return resp.OldValue, resp.HadOldValue, nil
 		}
 
+		lastErr = err
+		log.Printf("Error from server %s: %v", addr, err)
+
+		// If this is a connection error, try to reconnect
 		s, ok := status.FromError(err)
-		if !ok || (s.Code() != 14 && s.Code() != 4) { // Not unavailable or deadline exceeded
-			return "", false, err
-		}
-
-		log.Printf("Server connection error (attempt %d/%d): %v", 
-			attempt+1, c.config.RetryAttempts, err)
-		
-		// Try to reconnect
-		if connectErr := c.connect(); connectErr != nil {
-			log.Printf("Reconnect failed: %v", connectErr)
-		}
-
-		time.Sleep(c.config.RetryDelay)
-	}
-
-	return "", false, fmt.Errorf("failed after %d attempts", c.config.RetryAttempts)
-}
-
-// Helper function to print the formatted timestamp
-func formatTimestamp(timestamp uint64) string {
-	return time.Unix(0, int64(timestamp)).Format(time.RFC3339)
-}
-
-func main() {
-	// Configuration
-	config := ClientConfig{
-		ServerAddresses: []string{
-			"localhost:50051",
-			"localhost:50052",
-			"localhost:50053",
-		},
-		Timeout:       5 * time.Second,
-		RetryAttempts: 3,
-		RetryDelay:    500 * time.Millisecond,
-	}
-
-	// Initialize client
-	client, err := NewClient(config)
-	if err != nil {
-		log.Fatalf("Failed to initialize client: %v", err)
-	}
-	defer client.Close()
-
-	fmt.Println("=== Distributed Key-Value Store Client ===")
-
-	scanner := bufio.NewScanner(os.Stdin)
-	for {
-		fmt.Println("\nChoose an option:")
-		fmt.Println("1. Get value")
-		fmt.Println("2. Put value")
-		fmt.Println("3. Batch operations")
-		fmt.Println("4. Import data")
-		fmt.Println("5. Export data")
-		fmt.Println("6. Switch server")
-		fmt.Println("7. Exit")
-		fmt.Print("Enter choice (1-7): ")
-		
-		scanner.Scan()
-		choice := strings.TrimSpace(scanner.Text())
-		
-		switch choice {
-		case "1":
-			handleGet(client, scanner)
-		case "2":
-			handlePut(client, scanner)
-		case "3":
-			handleBatch(client, scanner)
-		case "4":
-			handleImport(client, scanner)
-		case "5":
-			handleExport(client, scanner)
-		case "6":
-			handleSwitchServer(client, scanner)
-		case "7":
-			fmt.Println("Exiting...")
-			return
-		default:
-			fmt.Println("Invalid choice, please try again")
+		if ok && (s.Code() == codes.Unavailable || s.Code() == codes.DeadlineExceeded) {
+			go func(address string) {
+				if err := c.connectToServer(address); err != nil {
+					log.Printf("Failed to reconnect to %s: %v", address, err)
+				}
+			}(addr)
 		}
 	}
+
+	return "", false, fmt.Errorf("all replicas failed: %v", lastErr)
 }
 
-func handleGet(client *Client, scanner *bufio.Scanner) {
-	fmt.Print("Enter key: ")
-	scanner.Scan()
-	key := strings.TrimSpace(scanner.Text())
-	
-	if key == "" {
-		fmt.Println("Key cannot be empty")
-		return
+// Add fallback Put implementation (existing implementation)
+func (c *Client) fallbackPut(ctx context.Context, key, value string) (string, bool, error) {
+	c.mu.RLock()
+	addresses := make([]string, 0, len(c.clients))
+	for addr := range c.clients {
+		addresses = append(addresses, addr)
 	}
-	
-	value, timestamp, exists, err := client.Get(key)
-	if err != nil {
-		fmt.Printf("Error getting value: %v\n", err)
-		return
-	}
-	
-	if exists {
-		fmt.Println("=== Key Found ===")
-		fmt.Printf("Key:         %s\n", key)
-		fmt.Printf("Value:       %s\n", value)
-		fmt.Printf("Last update: %s\n", formatTimestamp(timestamp))
-	} else {
-		fmt.Printf("Key '%s' not found\n", key)
-	}
-}
+	c.mu.RUnlock()
 
-func handlePut(client *Client, scanner *bufio.Scanner) {
-	fmt.Print("Enter key: ")
-	scanner.Scan()
-	key := strings.TrimSpace(scanner.Text())
-	
-	if key == "" {
-		fmt.Println("Key cannot be empty")
-		return
+	if len(addresses) == 0 {
+		return "", false, fmt.Errorf("no available servers")
 	}
-	
-	fmt.Print("Enter value: ")
-	scanner.Scan()
-	value := strings.TrimSpace(scanner.Text())
-	
-	oldValue, hadOldValue, err := client.Put(key, value)
-	if err != nil {
-		fmt.Printf("Error putting value: %v\n", err)
-		return
-	}
-	
-	if hadOldValue {
-		fmt.Printf("Updated key '%s' successfully\n", key)
-		fmt.Printf("Previous value: %s\n", oldValue)
-	} else {
-		fmt.Printf("Created new key '%s' successfully\n", key)
-	}
-}
 
-func handleBatch(client *Client, scanner *bufio.Scanner) {
-	fmt.Println("\n=== Batch Operations ===")
-	fmt.Println("Enter key-value pairs (one per line)")
-	fmt.Println("Format: PUT key value or GET key")
-	fmt.Println("Enter 'done' when finished")
-	
-	operations := make([]string, 0)
-	for {
-		fmt.Print("> ")
-		scanner.Scan()
-		line := strings.TrimSpace(scanner.Text())
-		
-		if line == "done" {
-			break
-		}
-		
-		operations = append(operations, line)
-	}
-	
-	if len(operations) == 0 {
-		fmt.Println("No operations to perform")
-		return
-	}
-	
-	// Process operations
-	fmt.Println("\n=== Results ===")
-	for i, op := range operations {
-		parts := strings.Fields(op)
-		if len(parts) < 2 {
-			fmt.Printf("[%d] Invalid format: %s\n", i+1, op)
-			continue
-		}
-		
-		cmd := strings.ToUpper(parts[0])
-		key := parts[1]
-		
-		switch cmd {
-		case "GET":
-			value, timestamp, exists, err := client.Get(key)
-			if err != nil {
-				fmt.Printf("[%d] GET %s: Error: %v\n", i+1, key, err)
-			} else if exists {
-				fmt.Printf("[%d] GET %s: %s (Updated: %s)\n", 
-					i+1, key, value, formatTimestamp(timestamp))
-			} else {
-				fmt.Printf("[%d] GET %s: Not found\n", i+1, key)
-			}
-			
-		case "PUT":
-			if len(parts) < 3 {
-				fmt.Printf("[%d] PUT requires a value\n", i+1)
+	// Choose initial server using round-robin
+	startIndex := int(atomic.AddUint64(&c.requestCounter, 1) % uint64(len(addresses)))
+
+	// Try each server until success or all fail
+	var lastErr error
+	for attempt := 0; attempt < c.config.RetryAttempts; attempt++ {
+		// Start with the selected server, then try others
+		for i := 0; i < len(addresses); i++ {
+			serverIndex := (startIndex + i) % len(addresses)
+			addr := addresses[serverIndex]
+
+			c.mu.RLock()
+			client, ok := c.clients[addr]
+			c.mu.RUnlock()
+
+			if !ok {
 				continue
 			}
-			
-			value := strings.Join(parts[2:], " ")
-			_, hadOldValue, err := client.Put(key, value)
-			if err != nil {
-				fmt.Printf("[%d] PUT %s: Error: %v\n", i+1, key, err)
-			} else if hadOldValue {
-				fmt.Printf("[%d] PUT %s: Updated successfully\n", i+1, key)
-			} else {
-				fmt.Printf("[%d] PUT %s: Created successfully\n", i+1, key)
+
+			reqCtx, cancel := context.WithTimeout(ctx, c.config.Timeout)
+			resp, err := client.Put(reqCtx, &pb.PutRequest{Key: key, Value: value})
+			cancel()
+
+			if err == nil {
+				// Success - update current server index for UI display
+				c.current = serverIndex
+				return resp.OldValue, resp.HadOldValue, nil
 			}
-			
-		default:
-			fmt.Printf("[%d] Unknown command: %s\n", i+1, cmd)
+
+			lastErr = err
+			log.Printf("Error from server %s: %v", addr, err)
+
+			// If this is a connection error, try to reconnect
+			s, ok := status.FromError(err)
+			if ok && (s.Code() == codes.Unavailable || s.Code() == codes.DeadlineExceeded) {
+				// Try to reconnect in background
+				go func(address string) {
+					if err := c.connectToServer(address); err != nil {
+						log.Printf("Failed to reconnect to %s: %v", address, err)
+					}
+				}(addr)
+			}
+		}
+
+		// All servers failed this attempt, wait before retry
+		if attempt < c.config.RetryAttempts-1 {
+			time.Sleep(c.config.RetryDelay)
 		}
 	}
+
+	return "", false, fmt.Errorf("all servers failed: %v", lastErr)
 }
 
-func handleImport(client *Client, scanner *bufio.Scanner) {
-	fmt.Print("Enter file path: ")
-	scanner.Scan()
-	path := strings.TrimSpace(scanner.Text())
-	
-	if path == "" {
-		fmt.Println("File path cannot be empty")
-		return
-	}
-	
-	file, err := os.Open(path)
-	if err != nil {
-		fmt.Printf("Failed to open file: %v\n", err)
-		return
-	}
-	defer file.Close()
-	
-	var data map[string]string
-	decoder := json.NewDecoder(file)
-	if err := decoder.Decode(&data); err != nil {
-		fmt.Printf("Failed to parse JSON: %v\n", err)
-		return
-	}
-	
-	fmt.Printf("Importing %d key-value pairs...\n", len(data))
-	
-	success := 0
-	for key, value := range data {
-		_, _, err := client.Put(key, value)
+// Add method to update ring state
+func (c *Client) updateRingState() error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	// Try to get ring state from any available server
+	var lastErr error
+	for addr, client := range c.clients {
+		ctx, cancel := context.WithTimeout(c.ctx, c.config.Timeout)
+		resp, err := client.GetRingState(ctx, &pb.RingStateRequest{})
+		cancel()
+
 		if err != nil {
-			fmt.Printf("Failed to import key '%s': %v\n", key, err)
-		} else {
-			success++
-		}
-	}
-	
-	fmt.Printf("Import complete: %d/%d successful\n", success, len(data))
-}
-
-func handleExport(client *Client, scanner *bufio.Scanner) {
-	fmt.Println("Note: Export functionality is limited as the API doesn't support listing all keys.")
-	fmt.Print("Enter comma-separated keys to export: ")
-	scanner.Scan()
-	keysInput := strings.TrimSpace(scanner.Text())
-	
-	if keysInput == "" {
-		fmt.Println("No keys specified")
-		return
-	}
-	
-	keys := strings.Split(keysInput, ",")
-	data := make(map[string]string)
-	
-	for _, key := range keys {
-		key = strings.TrimSpace(key)
-		if key == "" {
+			lastErr = err
+			log.Printf("Failed to get ring state from %s: %v", addr, err)
 			continue
 		}
-		
-		value, _, exists, err := client.Get(key)
-		if err != nil {
-			fmt.Printf("Failed to get key '%s': %v\n", key, err)
-		} else if exists {
-			data[key] = value
-		} else {
-			fmt.Printf("Key '%s' not found\n", key)
+
+		// Successfully got ring state
+		c.ringMu.Lock()
+
+		// Only update if this is a newer version
+		if resp.Version > c.ringVersion {
+			// Reset the ring
+			c.ring = consistenthash.NewRing(10)
+
+			// Add all nodes to the ring
+			for nodeID := range resp.Nodes {
+				c.ring.AddNode(nodeID)
+
+				// If we don't have this node's address yet, use a default one
+				// This will be updated when we connect to the node
+				if _, exists := c.nodeAddresses[nodeID]; !exists {
+					// Try to extract address from our connections
+					found := false
+					for serverAddr := range c.clients {
+						// This is a simplistic approach - in a real system you'd have
+						// a more robust way to map node IDs to addresses
+						if strings.Contains(serverAddr, strings.TrimPrefix(nodeID, "node-")) {
+							c.nodeAddresses[nodeID] = serverAddr
+							found = true
+							break
+						}
+					}
+
+					if !found {
+						// Use any server as fallback
+						for serverAddr := range c.clients {
+							c.nodeAddresses[nodeID] = serverAddr
+							break
+						}
+					}
+				}
+			}
+
+			c.ringVersion = resp.Version
+
+			log.Printf("Updated ring state: version=%d, nodes=%d",
+				c.ringVersion, len(resp.Nodes))
 		}
+
+		c.ringMu.Unlock()
+		return nil
 	}
-	
-	if len(data) == 0 {
-		fmt.Println("No data to export")
-		return
+
+	if lastErr != nil {
+		return fmt.Errorf("failed to get ring state from any server: %v", lastErr)
 	}
-	
-	fmt.Print("Enter output file path: ")
-	scanner.Scan()
-	path := strings.TrimSpace(scanner.Text())
-	
-	if path == "" {
-		fmt.Println("File path cannot be empty")
-		return
-	}
-	
-	file, err := os.Create(path)
-	if err != nil {
-		fmt.Printf("Failed to create file: %v\n", err)
-		return
-	}
-	defer file.Close()
-	
-	encoder := json.NewEncoder(file)
-	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(data); err != nil {
-		fmt.Printf("Failed to write JSON: %v\n", err)
-		return
-	}
-	
-	fmt.Printf("Successfully exported %d key-value pairs to %s\n", len(data), path)
+	return fmt.Errorf("no servers available to get ring state")
 }
 
-func handleSwitchServer(client *Client, scanner *bufio.Scanner) {
-	fmt.Println("Current server addresses:")
-	for i, addr := range client.config.ServerAddresses {
-		marker := " "
-		if i == client.current {
-			marker = "*"
-		}
-		fmt.Printf("%s %d: %s\n", marker, i+1, addr)
-	}
-	
-	fmt.Print("Enter new server index (or 'add' to add a new server): ")
-	scanner.Scan()
-	input := strings.TrimSpace(scanner.Text())
-	
-	if input == "add" {
-		fmt.Print("Enter new server address: ")
-		scanner.Scan()
-		addr := strings.TrimSpace(scanner.Text())
-		
-		if addr == "" {
-			fmt.Println("Server address cannot be empty")
+// Add background updater for ring state
+func (c *Client) ringStateUpdater() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if err := c.updateRingState(); err != nil {
+				log.Printf("Failed to update ring state: %v", err)
+			}
+		case <-c.ctx.Done():
 			return
 		}
-		
-		client.config.ServerAddresses = append(client.config.ServerAddresses, addr)
-		fmt.Printf("Added server %s\n", addr)
-		return
 	}
-	
-	var idx int
-	if _, err := fmt.Sscanf(input, "%d", &idx); err != nil {
-		fmt.Println("Invalid index")
-		return
-	}
-	
-	idx-- // Convert to 0-based
-	if idx < 0 || idx >= len(client.config.ServerAddresses) {
-		fmt.Println("Index out of range")
-		return
-	}
-	
-	client.current = idx
-	if err := client.connect(); err != nil {
-		fmt.Printf("Failed to connect to server: %v\n", err)
-		return
-	}
-	
-	fmt.Printf("Switched to server at %s\n", client.config.ServerAddresses[idx])
 }
