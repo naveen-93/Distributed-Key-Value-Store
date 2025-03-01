@@ -1,4 +1,4 @@
-package node
+package storage
 
 import (
 	"bufio"
@@ -152,7 +152,7 @@ func (w *WALWriter) Close() error {
 	return w.walFile.Close()
 }
 
-type Node struct {
+type Storage struct {
 	ID                uint32
 	LogicalClock      uint32 // Increased to 32-bit
 	mu                sync.RWMutex
@@ -252,7 +252,7 @@ func parseWALEntry(line string) (*WALEntry, error) {
 	return entry, nil
 }
 
-func NewNode(id uint32, replicationFactor ...int) *Node {
+func NewStorage(id uint32, replicationFactor ...int) *Storage {
 	rf := 3 // Default replication factor
 	if len(replicationFactor) > 0 && replicationFactor[0] > 0 {
 		rf = replicationFactor[0]
@@ -263,7 +263,7 @@ func NewNode(id uint32, replicationFactor ...int) *Node {
 		log.Fatalf("Failed to create WAL writer: %v", err)
 	}
 
-	n := &Node{
+	n := &Storage{
 		ID:                id,
 		LogicalClock:      0,
 		store:             make(map[string]*KeyValue),
@@ -273,14 +273,14 @@ func NewNode(id uint32, replicationFactor ...int) *Node {
 	}
 
 	// Initialize background tasks
-	n.checkWALSize()
-	n.startTTLCleanup() // Start TTL cleanup process
+	n.CheckWALSize()
+	n.StartTTLCleanup() // Start TTL cleanup process
 	n.recoverFromWAL()
 
 	return n
 }
 
-func (n *Node) generateTimestamp() uint64 {
+func (n *Storage) generateTimestamp() uint64 {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
@@ -306,7 +306,7 @@ func (n *Node) generateTimestamp() uint64 {
 	return (uint64(n.ID) << 48) | (uint64(physical&0xFFFFFFFF) << 16) | uint64(n.LogicalClock&0xFFFF)
 }
 
-func (n *Node) Store(key, value string, timestamp uint64, ttl ...uint64) error {
+func (n *Storage) Store(key, value string, timestamp uint64, ttl ...uint64) error {
 	defaultTTL := uint64(0)
 	if len(ttl) > 0 {
 		defaultTTL = ttl[0]
@@ -342,7 +342,7 @@ func (n *Node) Store(key, value string, timestamp uint64, ttl ...uint64) error {
 	return nil
 }
 
-func (n *Node) Delete(key string) error {
+func (n *Storage) Delete(key string) error {
 	timestamp := n.generateTimestamp()
 
 	// Write tombstone to WAL first
@@ -370,7 +370,7 @@ func (n *Node) Delete(key string) error {
 	return nil
 }
 
-func (n *Node) Get(key string) (string, uint64, bool) {
+func (n *Storage) Get(key string) (string, uint64, bool) {
 	n.storeMu.RLock()
 	defer n.storeMu.RUnlock()
 
@@ -385,7 +385,7 @@ func (n *Node) Get(key string) (string, uint64, bool) {
 }
 
 // GetKeys returns all keys in the store
-func (n *Node) GetKeys() []string {
+func (n *Storage) GetKeys() []string {
 	n.storeMu.RLock()
 	defer n.storeMu.RUnlock()
 
@@ -396,7 +396,7 @@ func (n *Node) GetKeys() []string {
 	return keys
 }
 
-func (n *Node) cleanupSnapshots() error {
+func (n *Storage) cleanupSnapshots() error {
 	files, err := os.ReadDir(snapshotPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -448,7 +448,7 @@ func (n *Node) cleanupSnapshots() error {
 	return nil
 }
 
-func (n *Node) compactWAL() error {
+func (n *Storage) compactWAL() error {
 	// Take a read lock for creating snapshot
 	n.storeMu.RLock()
 	snapshot := Snapshot{
@@ -489,7 +489,7 @@ func (n *Node) compactWAL() error {
 }
 
 // New helper method for WAL compaction
-func (n *Node) handleWALCompaction(snapshot *Snapshot) error {
+func (n *Storage) handleWALCompaction(snapshot *Snapshot) error {
 
 	// Verify write permissions
 	testFile := filepath.Join(snapshotPath, "write_test.tmp")
@@ -529,7 +529,7 @@ func (n *Node) handleWALCompaction(snapshot *Snapshot) error {
 }
 
 // Helper method for writing snapshot to file
-func (n *Node) writeSnapshotToFile(filename string, snapshot *Snapshot) error {
+func (n *Storage) writeSnapshotToFile(filename string, snapshot *Snapshot) error {
 	// Compute checksum before writing
 	snapshot.Checksum = snapshot.computeChecksum()
 
@@ -552,7 +552,7 @@ func (n *Node) writeSnapshotToFile(filename string, snapshot *Snapshot) error {
 	return nil
 }
 
-func (n *Node) truncateWAL(timestamp uint64) error {
+func (n *Storage) truncateWAL(timestamp uint64) error {
 	// Create new WAL file
 	newWAL, err := os.Create(fmt.Sprintf("wal-%d.log.new", n.ID))
 	if err != nil {
@@ -593,7 +593,7 @@ func (n *Node) truncateWAL(timestamp uint64) error {
 	return nil
 }
 
-func (n *Node) checkWALSize() {
+func (n *Storage) CheckWALSize() {
 	ticker := time.NewTicker(5 * time.Minute)
 	go func() {
 		for range ticker.C {
@@ -612,7 +612,7 @@ func (n *Node) checkWALSize() {
 	}()
 }
 
-func (n *Node) recoverFromWAL() error {
+func (n *Storage) recoverFromWAL() error {
 	// First try to recover from latest snapshot
 	var snapshotTimestamp uint64
 	if err := n.recoverFromSnapshot(); err != nil {
@@ -700,7 +700,7 @@ func (n *Node) recoverFromWAL() error {
 	return nil
 }
 
-func (n *Node) recoverFromSnapshot() error {
+func (n *Storage) recoverFromSnapshot() error {
 	// Find latest snapshot
 	files, err := os.ReadDir(snapshotPath)
 	if err != nil {
@@ -760,7 +760,7 @@ func (n *Node) recoverFromSnapshot() error {
 	return nil
 }
 
-func (n *Node) startTTLCleanup() {
+func (n *Storage) StartTTLCleanup() {
 	ticker := time.NewTicker(1 * time.Hour)
 	go func() {
 		defer ticker.Stop()
@@ -775,7 +775,7 @@ func (n *Node) startTTLCleanup() {
 	}()
 }
 
-func (n *Node) cleanupExpiredEntries() {
+func (n *Storage) cleanupExpiredEntries() {
 	n.storeMu.Lock()
 	defer n.storeMu.Unlock()
 
@@ -792,7 +792,7 @@ func (n *Node) cleanupExpiredEntries() {
 	}
 }
 
-func (n *Node) Shutdown() error {
+func (n *Storage) Shutdown() error {
 	close(n.stopChan) // Signal all background tasks to stop
 	if err := n.walWriter.Close(); err != nil {
 		return fmt.Errorf("failed to close WAL: %v", err)
@@ -830,4 +830,15 @@ func bool2int(b bool) uint8 {
 		return 1
 	}
 	return 0
+}
+
+// Add this method to the Storage struct
+func (n *Storage) GarbageCollect(key string) error {
+	n.storeMu.Lock()
+	defer n.storeMu.Unlock()
+
+	if _, exists := n.store[key]; exists {
+		delete(n.store, key) // Remove the key from the store
+	}
+	return nil
 }

@@ -472,7 +472,73 @@ func (n *Node) IsPrimary(key string) bool {
 	return n.ID == hash
 }
 
+// isResponsibleForKey checks if this node should store the given key
+// based on consistent hashing and replication factor
+func (n *Node) isResponsibleForKey(key string) bool {
+	// Get the primary node for this key
+	hash := n.ring.HashKey(key)
+	primaryNode := n.ring.GetNode(fmt.Sprintf("%d", hash))
+
+	// If this is the primary node, return true
+	if primaryNode == fmt.Sprintf("node-%d", n.ID) {
+		return true
+	}
+
+	// Check if this node is one of the replicas
+	currentHash := hash
+	for i := 1; i < n.replicationFactor; i++ {
+		nextNodeID := n.ring.GetNextNode(currentHash)
+		if nextNodeID == "" {
+			break
+		}
+
+		if nextNodeID == fmt.Sprintf("node-%d", n.ID) {
+			return true
+		}
+
+		currentHash = n.ring.HashKey(nextNodeID)
+	}
+
+	return false
+}
+
+// forwardToResponsibleNode forwards a key-value operation to the appropriate node
+func (n *Node) forwardToResponsibleNode(ctx context.Context, key, value string) (*pb.PutResponse, error) {
+	hash := n.ring.HashKey(key)
+	primaryNodeID := n.ring.GetNode(fmt.Sprintf("%d", hash))
+
+	// Extract node ID from the string format "node-X"
+	nodeID, err := strconv.ParseUint(strings.TrimPrefix(primaryNodeID, "node-"), 10, 32)
+	if err != nil {
+		return nil, fmt.Errorf("invalid node ID format: %v", err)
+	}
+
+	// Get the client for the responsible node
+	n.clientsMu.RLock()
+	client, exists := n.clients[uint32(nodeID)]
+	n.clientsMu.RUnlock()
+
+	if !exists {
+		return nil, fmt.Errorf("no client available for responsible node %s", primaryNodeID)
+	}
+
+	// Forward the request
+	return client.Put(ctx, &pb.PutRequest{
+		Key:   key,
+		Value: value,
+	})
+}
+
+// Update Put to check responsibility before storing
 func (n *Node) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
+	// Check if this node is responsible for the key
+	if !n.isResponsibleForKey(req.Key) {
+		// If not responsible, forward to the correct node
+		log.Printf("Node %d not responsible for key %s, forwarding to responsible node", n.ID, req.Key)
+		return n.forwardToResponsibleNode(ctx, req.Key, req.Value)
+	}
+
+	// Original Put logic for responsible nodes
 	writeQuorum := (n.replicationFactor / 2) + 1
 	successCount := 1 // Count self as first success
 
@@ -551,10 +617,11 @@ func (n *Node) GetReplica(ctx context.Context, req *pb.GetReplicaRequest) (*pb.G
 	}, nil
 }
 
-// Update Get to use GetReplica
+// Update Get to use GetReplica with proper replica verification and retries
 func (n *Node) Get(ctx context.Context, req *pb.GetRequest) (pb.GetResponse, error) {
-	// Use a context with timeout for replica queries
-	replicaCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	// Use a configurable timeout instead of hardcoded 2s
+	timeoutDuration := 2 * time.Second // Could be made configurable via Node struct
+	replicaCtx, cancel := context.WithTimeout(ctx, timeoutDuration)
 	defer cancel()
 
 	readQuorum := (n.replicationFactor / 2) + 1
@@ -563,43 +630,91 @@ func (n *Node) Get(ctx context.Context, req *pb.GetRequest) (pb.GetResponse, err
 		timestamp uint64
 		exists    bool
 		err       error
-	}, n.replicationFactor) // Initially size to replicationFactor
+	}, n.replicationFactor)
 
-	// Get local value
-	value, timestamp, exists := n.Store.Get(req.Key)
-	responses <- struct {
-		value     string
-		timestamp uint64
-		exists    bool
-		err       error
-	}{string(value), uint64(timestamp), exists, nil}
-
-	// Query replicas using GetReplica
+	// Get the list of replica nodes for this key
 	hash := n.ring.HashKey(req.Key)
+
+	// Track queried nodes and retries
+	queriedNodes := 0
+	maxRetries := 2
+
+	// Check if local node is a replica before including local data
+	if n.isResponsibleForKey(req.Key) {
+		queriedNodes++
+		value, timestamp, exists := n.Store.Get(req.Key)
+		responses <- struct {
+			value     string
+			timestamp uint64
+			exists    bool
+			err       error
+		}{string(value), uint64(timestamp), exists, nil}
+	}
+
+	// Query other replicas
 	currentHash := hash
-	queriedNodes := 1 // Start with the local node
+	replicaNodes := make([]uint32, 0, n.replicationFactor)
 
-	for i := 1; i < n.replicationFactor; i++ {
-		nextNodeID := n.ring.GetNextNode(currentHash)
-		if nextNodeID == "" {
-			break // No more nodes available
+	// Find all replica nodes
+	for i := 0; i < n.replicationFactor; i++ {
+		nodeID := n.ring.GetNode(fmt.Sprintf("%d", currentHash))
+		if nodeID == "" {
+			break
 		}
 
-		nodeID, _ := strconv.ParseUint(nextNodeID, 10, 32)
-		if client, ok := n.clients[uint32(nodeID)]; ok {
-			queriedNodes++ // Increment the count of queried nodes
-			go func(c pb.NodeInternalClient) {
-				replicaReq := &pb.GetReplicaRequest{Key: req.Key}
-				resp, err := c.GetReplica(replicaCtx, replicaReq)
-				responses <- struct {
-					value     string
-					timestamp uint64
-					exists    bool
-					err       error
-				}{resp.Value, resp.Timestamp, resp.Exists, err}
-			}(client)
+		id, err := strconv.ParseUint(strings.TrimPrefix(nodeID, "node-"), 10, 32)
+		if err == nil && uint32(id) != n.ID { // Skip self as we already checked
+			replicaNodes = append(replicaNodes, uint32(id))
 		}
-		currentHash = n.ring.HashKey(nextNodeID)
+
+		currentHash = n.ring.HashKey(nodeID)
+	}
+
+	// Query all replica nodes with retry logic
+	for _, nodeID := range replicaNodes {
+		if client, ok := n.clients[nodeID]; ok {
+			queriedNodes++
+			go func(c pb.NodeInternalClient, nodeID uint32) {
+				// Implement retry logic
+				var resp *pb.GetReplicaResponse
+				var err error
+
+				for retry := 0; retry <= maxRetries; retry++ {
+					if retry > 0 {
+						// Exponential backoff
+						backoff := time.Duration(50*(1<<retry)) * time.Millisecond
+						time.Sleep(backoff)
+					}
+
+					// Create a new context for each retry
+					reqCtx, reqCancel := context.WithTimeout(replicaCtx, timeoutDuration/(time.Duration(retry+1)))
+					resp, err = c.GetReplica(reqCtx, &pb.GetReplicaRequest{Key: req.Key})
+					reqCancel()
+
+					if err == nil {
+						break // Success, exit retry loop
+					}
+
+					log.Printf("Retry %d for key %s from node %d: %v", retry, req.Key, nodeID, err)
+				}
+
+				if resp != nil {
+					responses <- struct {
+						value     string
+						timestamp uint64
+						exists    bool
+						err       error
+					}{resp.Value, resp.Timestamp, resp.Exists, err}
+				} else {
+					responses <- struct {
+						value     string
+						timestamp uint64
+						exists    bool
+						err       error
+					}{"", 0, false, err}
+				}
+			}(client, nodeID)
+		}
 	}
 
 	// Wait for responses and find the latest value
@@ -610,7 +725,10 @@ func (n *Node) Get(ctx context.Context, req *pb.GetRequest) (pb.GetResponse, err
 		exists    bool
 	}
 
-	for i := 0; i < queriedNodes; i++ { // Adjust loop to the number of queried nodes
+	// Set a deadline for collecting responses
+	deadline := time.After(timeoutDuration)
+
+	for i := 0; i < queriedNodes; i++ {
 		select {
 		case resp := <-responses:
 			if resp.err == nil {
@@ -624,14 +742,33 @@ func (n *Node) Get(ctx context.Context, req *pb.GetRequest) (pb.GetResponse, err
 				}
 				if successCount >= readQuorum {
 					// Perform read repair if needed
-					if latest.exists && latest.timestamp > timestamp {
-						go n.Store.Store(req.Key, latest.value, latest.timestamp)
+					if latest.exists && n.isResponsibleForKey(req.Key) {
+						_, localTs, _ := n.Store.Get(req.Key)
+						if latest.timestamp > localTs {
+							go n.Store.Store(req.Key, latest.value, latest.timestamp)
+						}
 					}
-					break // Exit early if quorum is reached
+					// Exit early if quorum is reached
+					return pb.GetResponse{
+						Value:     latest.value,
+						Exists:    latest.exists,
+						Timestamp: latest.timestamp,
+					}, nil
 				}
 			}
+		case <-deadline:
+			// If we hit the deadline but have some responses, we might still return
+			if successCount > 0 {
+				log.Printf("Partial quorum for key %s: got %d, need %d", req.Key, successCount, readQuorum)
+				return pb.GetResponse{
+					Value:     latest.value,
+					Exists:    latest.exists,
+					Timestamp: latest.timestamp,
+				}, nil
+			}
+			return pb.GetResponse{}, fmt.Errorf("timed out waiting for read quorum: got %d, need %d", successCount, readQuorum)
 		case <-ctx.Done():
-			return pb.GetResponse{}, fmt.Errorf("failed to achieve read quorum: %v", ctx.Err())
+			return pb.GetResponse{}, fmt.Errorf("context canceled while waiting for read quorum: %v", ctx.Err())
 		}
 	}
 

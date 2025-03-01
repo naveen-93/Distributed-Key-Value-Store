@@ -17,7 +17,14 @@ service NodeInternal {
   rpc Heartbeat(Ping) returns (Pong) {}
   rpc GarbageCollect(GarbageCollectRequest) returns (GarbageCollectResponse) {}
   rpc GetReplica(GetReplicaRequest) returns (GetReplicaResponse) {}
+  rpc AddNode(AddNodeRequest) returns (Empty);
 }
+
+message AddNodeRequest {
+  string node_id = 1;
+  string addr = 2;
+}
+message Empty {}
 
 message GetRequest {
   string key = 1;

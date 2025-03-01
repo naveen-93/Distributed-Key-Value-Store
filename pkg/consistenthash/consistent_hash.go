@@ -9,13 +9,29 @@ import (
 	"time"
 
 	"github.com/spaolacci/murmur3"
+	"strings"
+	"strconv"
 )
 
 const (
 	DefaultVirtualNodes   = 10
 	MaxAttemptsMultiplier = 100 // Increased multiplier for more collision attempts
 )
+// NodeID represents the format of a node identifier
+const NodeIDPrefix = "node-"
 
+// GetNodeID extracts the node ID from the full identifier
+func GetNodeID(node string) (uint32, error) {
+    if !strings.HasPrefix(node, NodeIDPrefix) {
+        return 0, fmt.Errorf("invalid node identifier format: %s", node)
+    }
+    idStr := strings.TrimPrefix(node, NodeIDPrefix)
+    id, err := strconv.ParseUint(idStr, 10, 32)
+    if err != nil {
+        return 0, fmt.Errorf("failed to parse node ID: %v", err)
+    }
+    return uint32(id), nil
+}
 // Ring represents a consistent hash ring
 type Ring struct {
 	sync.RWMutex
@@ -43,51 +59,53 @@ func NewRing(vnodeCount int) *Ring {
 }
 
 // AddNode adds a node and its virtual nodes to the ring
+// AddNode adds a node and its virtual nodes to the ring
 func (r *Ring) AddNode(node string) {
-	r.Lock()
-	defer r.Unlock()
+    r.Lock()
+    defer r.Unlock()
 
-	if _, exists := r.vnodes[node]; exists {
-		return // Node already exists
-	}
+    if _, exists := r.vnodes[node]; exists {
+        return // Node already exists
+    }
 
-	hashes := make([]uint32, 0, r.vnodeCount)
-	attempts := 0
-	collisions := 0
-	maxAttempts := r.vnodeCount * MaxAttemptsMultiplier
+    hashes := make([]uint32, 0, r.vnodeCount)
+    attempts := 0
+    collisions := 0
+    maxAttempts := r.vnodeCount * MaxAttemptsMultiplier
 
-	for i := 0; i < r.vnodeCount && attempts < maxAttempts; {
-		// Generate unique suffix using node, index, and random component
-		uniqueSuffix := r.randSource.Intn(1000000)
-		vnodeKey := fmt.Sprintf("%s-vnode-%d-%d", node, i, uniqueSuffix)
-		hash := r.HashKey(vnodeKey)
+    for i := 0; i < r.vnodeCount && attempts < maxAttempts; {
+        // Generate unique suffix using node, index, and random component
+        uniqueSuffix := r.randSource.Intn(1000000)
+        vnodeKey := fmt.Sprintf("%s-vnode-%d-%d", node, i, uniqueSuffix)
+        hash := r.HashKey(vnodeKey)
 
-		if _, exists := r.mapping[hash]; exists {
-			collisions++
-			attempts++
-			continue
-		}
+        if _, exists := r.mapping[hash]; exists {
+            collisions++
+            attempts++
+            continue
+        }
 
-		hashes = append(hashes, hash)
-		r.mapping[hash] = node
-		i++
-		attempts++
-	}
+        hashes = append(hashes, hash)
+        r.mapping[hash] = node
+        i++
+        attempts++
+    }
 
-	if collisions > 0 {
-		fmt.Printf("Warning: Node %s experienced %d hash collisions while adding virtual nodes\n", node, collisions)
-	}
+    if collisions > 0 {
+        fmt.Printf("Warning: Node %s experienced %d hash collisions while adding virtual nodes\n", node, collisions)
+    }
 
-	if len(hashes) < r.vnodeCount {
-		fmt.Printf("Warning: Node %s could only add %d/%d virtual nodes due to excessive collisions\n",
-			node, len(hashes), r.vnodeCount)
-	}
+    if len(hashes) < r.vnodeCount {
+        fmt.Printf("Warning: Node %s could only add %d/%d virtual nodes due to excessive collisions\n",
+            node, len(hashes), r.vnodeCount)
+        // Consider increasing the hash space or using a different strategy here
+    }
 
-	r.vnodes[node] = hashes
-	r.hashRing = append(r.hashRing, hashes...)
-	sort.Slice(r.hashRing, func(i, j int) bool {
-		return r.hashRing[i] < r.hashRing[j]
-	})
+    r.vnodes[node] = hashes
+    r.hashRing = append(r.hashRing, hashes...)
+    sort.Slice(r.hashRing, func(i, j int) bool {
+        return r.hashRing[i] < r.hashRing[j]
+    })
 }
 
 // RemoveNode removes a node and its virtual nodes from the ring
