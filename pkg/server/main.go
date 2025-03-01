@@ -20,7 +20,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"Distributed-Key-Value-Store/internal/node"
+	"Distributed-Key-Value-Store/internal/storage"
 	pb "Distributed-Key-Value-Store/kvstore/proto"
 	"Distributed-Key-Value-Store/pkg/consistenthash"
 
@@ -32,7 +32,7 @@ type server struct {
 	pb.UnimplementedNodeInternalServer
 
 	nodeID string
-	store  *node.Node
+	store  *storage.Node
 	ring   *consistenthash.Ring
 	mu     sync.RWMutex
 
@@ -77,41 +77,41 @@ type RebalanceConfig struct {
 }
 
 func NewServer(nodeID string, config *ServerConfig) (*server, error) {
-    if config.heartbeatInterval <= 0 {
-        return nil, fmt.Errorf("heartbeatInterval must be positive, got %v", config.heartbeatInterval)
-    }
-    if config.replicationFactor <= 0 {
-        return nil, fmt.Errorf("replicationFactor must be positive, got %d", config.replicationFactor)
-    }
-    if config.virtualNodes <= 0 {
-        return nil, fmt.Errorf("virtualNodes must be positive, got %d", config.virtualNodes)
-    }
+	if config.heartbeatInterval <= 0 {
+		return nil, fmt.Errorf("heartbeatInterval must be positive, got %v", config.heartbeatInterval)
+	}
+	if config.replicationFactor <= 0 {
+		return nil, fmt.Errorf("replicationFactor must be positive, got %d", config.replicationFactor)
+	}
+	if config.virtualNodes <= 0 {
+		return nil, fmt.Errorf("virtualNodes must be positive, got %d", config.virtualNodes)
+	}
 
-    ctx, cancel := context.WithCancel(context.Background())
-    s := &server{
-        nodeID:            nodeID,
-        store:             node.NewNode(uint32(consistenthash.HashString(nodeID)), config.replicationFactor),
-        ring:              consistenthash.NewRing(config.virtualNodes),
-        peers:             make(map[string]string),
-        clients:           make(map[string]pb.NodeInternalClient),
-        syncInterval:      config.syncInterval,
-        heartbeatInterval: config.heartbeatInterval,
-        replicationFactor: config.replicationFactor,
-        stopChan:          make(chan struct{}),
-        rebalanceConfig: RebalanceConfig{
-            BatchSize:     1000,
-            BatchTimeout:  30 * time.Second,
-            MaxConcurrent: 5,
-            RetryAttempts: 3,
-        },
-        ctx:    ctx,
-        cancel: cancel,
-    }
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &server{
+		nodeID:            nodeID,
+		store:             storage.NewNode(uint32(consistenthash.HashString(nodeID)), config.replicationFactor),
+		ring:              consistenthash.NewRing(config.virtualNodes),
+		peers:             make(map[string]string),
+		clients:           make(map[string]pb.NodeInternalClient),
+		syncInterval:      config.syncInterval,
+		heartbeatInterval: config.heartbeatInterval,
+		replicationFactor: config.replicationFactor,
+		stopChan:          make(chan struct{}),
+		rebalanceConfig: RebalanceConfig{
+			BatchSize:     1000,
+			BatchTimeout:  30 * time.Second,
+			MaxConcurrent: 5,
+			RetryAttempts: 3,
+		},
+		ctx:    ctx,
+		cancel: cancel,
+	}
 
-    // Add self to ring using full UUID
-    s.ring.AddNode(fmt.Sprintf("node-%s", nodeID))
-    s.startHeartbeat()
-    return s, nil
+	// Add self to ring using full UUID
+	s.ring.AddNode(fmt.Sprintf("node-%s", nodeID))
+	s.startHeartbeat()
+	return s, nil
 }
 
 func (s *server) addPeer(peerID string, addr string) error {
@@ -184,28 +184,28 @@ func validateKeyValue(key, value string) error {
 }
 
 func (s *server) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
-    if err := validateKeyValue(req.Key, req.Value); err != nil {
-        return nil, err
-    }
+	if err := validateKeyValue(req.Key, req.Value); err != nil {
+		return nil, err
+	}
 
-    // Generate timestamp
-    timestamp := uint64(time.Now().UnixNano())
+	// Generate timestamp
+	timestamp := uint64(time.Now().UnixNano())
 
-    // Store locally first
-    err := s.store.Store(req.Key, req.Value, timestamp)
-    if err != nil {
-        return nil, err
-    }
+	// Store locally first
+	err := s.store.Store(req.Key, req.Value, timestamp)
+	if err != nil {
+		return nil, err
+	}
 
-    // Replicate to other nodes asynchronously
-    s.replicateToNodes(req.Key, req.Value, timestamp)
+	// Replicate to other nodes asynchronously
+	s.replicateToNodes(req.Key, req.Value, timestamp)
 
-    // Return immediately after local store (eventual consistency)
-    oldValue, _, hadOldValue := s.store.Get(req.Key)
-    return &pb.PutResponse{
-        OldValue:    string(oldValue),
-        HadOldValue: hadOldValue,
-    }, nil
+	// Return immediately after local store (eventual consistency)
+	oldValue, _, hadOldValue := s.store.Get(req.Key)
+	return &pb.PutResponse{
+		OldValue:    string(oldValue),
+		HadOldValue: hadOldValue,
+	}, nil
 }
 
 // Add helper method to check if this node is a designated replica for a key
@@ -294,42 +294,43 @@ func (s *server) GetRingState(ctx context.Context, req *pb.RingStateRequest) (*p
 }
 
 // Update replicateToNodes to be more selective
-func (s *server) replicateToNodes(key, value string, timestamp uint64) {
+func (s *server) replicateToNodes(key string, value string, timestamp uint64) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	// Get replica nodes from ring
-	hash := s.ring.HashKey(key)
-	replicasSent := 1 // Count self as first replica
-	currentHash := hash
-
+	// Create replication request
 	req := &pb.ReplicateRequest{
 		Key:       key,
 		Value:     value,
 		Timestamp: timestamp,
 	}
 
-	// Send to next nodes in ring until we hit replicationFactor
+	// Get replica nodes using consistent hashing
+	hash := s.ring.HashKey(key)
+	currentHash := hash
+	replicasSent := 0
+
+	// Send to next nodes in the ring
 	for replicasSent < s.replicationFactor {
 		nextNodeID := s.ring.GetNextNode(currentHash)
-		if nextNodeID == "" || nextNodeID == fmt.Sprintf("node-%s", s.nodeID) {
-			break // No more nodes available or wrapped around to self
+		if nextNodeID == "" {
+			break // No more nodes available
 		}
 
 		// Extract UUID from node ID format "node-{uuid}"
 		peerID := strings.TrimPrefix(nextNodeID, "node-")
 		if client, ok := s.clients[peerID]; ok {
-			go func(c pb.NodeInternalClient, nodeID string) {
+			go func(c pb.NodeInternalClient) {
 				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 				defer cancel()
 
 				resp, err := c.Replicate(ctx, req)
 				if err != nil {
-					log.Printf("Failed to replicate to node %s: %v", nodeID, err)
+					log.Printf("Failed to replicate to node %s: %v", nextNodeID, err)
 				} else if !resp.Success {
-					log.Printf("Replication rejected by node %s: %s", nodeID, resp.Error)
+					log.Printf("Replication rejected by node %s: %s", nextNodeID, resp.Error)
 				}
-			}(client, nextNodeID)
+			}(client)
 			replicasSent++
 		}
 
@@ -616,4 +617,5 @@ func main() {
 		log.Printf("Error during shutdown: %v", err)
 	}
 	log.Println("Server stopped")
-} 
+}
+

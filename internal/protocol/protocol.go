@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"Distributed-Key-Value-Store/internal/node"
+	"Distributed-Key-Value-Store/internal/storage"
 	pb "Distributed-Key-Value-Store/kvstore/proto"
 	"Distributed-Key-Value-Store/pkg/consistenthash"
 
@@ -20,7 +20,7 @@ import (
 
 type Node struct {
 	ID           uint32
-	store        *node.Node
+	store        *storage.Node
 	logicalClock uint64
 
 	storeMu sync.RWMutex
@@ -52,7 +52,7 @@ type Node struct {
 	lastPhysicalTime int64
 }
 
-func NewNode(id uint32, store *node.Node, replicationFactor int) *Node {
+func NewNode(id uint32, store *storage.Node, replicationFactor int) *Node {
 	return &Node{
 		ID:                id,
 		store:             store,
@@ -267,6 +267,11 @@ func (n *Node) getClients() map[uint32]pb.NodeInternalClient {
 	}
 	return clients
 }
+func (n *Node) IsPrimary(key string) bool {
+	hash := n.ring.HashKey(key)
+	return n.ID == hash%uint32(len(n.nodes))
+}
+
 
 func (n *Node) StartHeartbeat() {
 	go func() {
@@ -449,10 +454,6 @@ func (n *Node) replicateToNodes(key string, value string, timestamp uint64) {
 	}
 }
 
-func (n *Node) IsPrimary(key string) bool {
-	hash := n.ring.HashKey(key) % uint32(len(n.nodes))
-	return n.ID == hash
-}
 
 // Put handles incoming write requests with quorum enforcement
 func (n *Node) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
