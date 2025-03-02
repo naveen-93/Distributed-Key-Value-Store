@@ -169,3 +169,29 @@ The system handles failures through:
 - WAL and snapshot-based durability
 - N-way replication
 - Automatic ring updates on node failures
+
+ 
+
+## How to client library
+#clean up 
+-sudo kill $(sudo lsof -t -i :50051)
+-rm wal*
+#First Run 3 nodes
+ -bash run.sh
+# run test client library
+ -cd lib
+ -make clean && make 
+ -make test
+
+## Correctness check 
+
+#clean up 
+-sudo kill $(sudo lsof -t -i :50051)
+-rm wal*
+#First Run 3 nodes
+-bash run.sh
+
+ #correctness test
+-cd tests
+-go test -v
+ 

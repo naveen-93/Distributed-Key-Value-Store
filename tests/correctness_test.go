@@ -1,4 +1,4 @@
-package client
+package test
 
 import (
 	"context"
@@ -25,9 +25,9 @@ var serverProcesses []*exec.Cmd
 // TestMain sets up the test environment
 func TestMain(m *testing.M) {
 	// Start servers
-	// if err := startServers(); err != nil {
-	// 	log.Fatalf("Failed to start servers: %v", err)
-	// }
+	if err := startServers(); err != nil {
+		log.Fatalf("Failed to start servers: %v", err)
+	}
 
 	// Wait for servers to initialize
 	time.Sleep(3 * time.Second)
@@ -68,12 +68,17 @@ func startServers() error {
 		args := []string{"run", "../pkg/server/main.go",
 			"--id", nodeID,
 			"--addr", addr,
-			"--replication-factor", "2",
+			"--replication-factor", "3",
 			"--peers", strings.Join(peerList, ",")}
 		cmd := exec.Command("go", args...)
 
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
+		// Redirect output to /dev/null instead of stdout/stderr
+		devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+		if err != nil {
+			return fmt.Errorf("failed to open /dev/null: %v", err)
+		}
+		cmd.Stdout = devNull
+		cmd.Stderr = devNull
 
 		if err := cmd.Start(); err != nil {
 			stopServers() // Clean up any servers that did start
@@ -201,6 +206,11 @@ func TestConsistency(t *testing.T) {
 
 // TestFaultTolerance verifies that the system can handle node failures
 func TestFaultTolerance(t *testing.T) {
+	// Skip the test if no servers are running
+	if len(serverProcesses) == 0 {
+		t.Skip("No server processes available, skipping test")
+	}
+
 	// Create client
 	cfg := client.ClientConfig{
 		ServerAddresses: getServerAddresses(),
@@ -314,7 +324,7 @@ func TestReadRepair(t *testing.T) {
 		if j != serverToKill {
 			peerNodeID := fmt.Sprintf("%d", j+1)
 			peerAddr := fmt.Sprintf("localhost:%d", basePort+j)
-			peerArgs = append(peerArgs, fmt.Sprintf("--peer=%s@%s", peerNodeID, peerAddr))
+			peerArgs = append(peerArgs, fmt.Sprintf("--peers=%s@%s", peerNodeID, peerAddr))
 		}
 	}
 
