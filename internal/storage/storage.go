@@ -312,6 +312,29 @@ func (n *Storage) Store(key, value string, timestamp uint64, ttl ...uint64) erro
 		defaultTTL = ttl[0]
 	}
 
+	// Check if this is an update to an existing key
+	n.storeMu.RLock()
+	existingKV, exists := n.store[key]
+	n.storeMu.RUnlock()
+
+	// If this is an update, write a DELETE entry for the old value first
+	if exists && !existingKV.IsTombstone {
+		deleteEntry := &WALEntry{
+			Operation: "DELETE",
+			Key:       key,
+			Timestamp: timestamp - 1, // Use slightly earlier timestamp for the delete
+			CreatedAt: timeNow().Unix(),
+			TTL:       0,
+		}
+
+		// Write the delete entry to WAL
+		if err := n.walWriter.Write(deleteEntry); err != nil {
+			log.Printf("WAL delete write failed: %v", err)
+			return err
+		}
+	}
+
+	// Now write the new PUT entry
 	entry := &WALEntry{
 		Operation: "PUT",
 		Key:       key,
@@ -321,7 +344,7 @@ func (n *Storage) Store(key, value string, timestamp uint64, ttl ...uint64) erro
 		TTL:       defaultTTL,
 	}
 
-	// Write to WAL first
+	// Write to WAL
 	if err := n.walWriter.Write(entry); err != nil {
 		log.Printf("WAL write failed: %v", err)
 		return err
@@ -330,6 +353,8 @@ func (n *Storage) Store(key, value string, timestamp uint64, ttl ...uint64) erro
 	// Update store only after successful WAL write
 	n.storeMu.Lock()
 	defer n.storeMu.Unlock()
+
+	// Double-check if we should update (in case another thread updated while we were writing to WAL)
 	existing, exists := n.store[key]
 	if !exists || timestamp > existing.Timestamp {
 		n.store[key] = &KeyValue{
@@ -792,11 +817,25 @@ func (n *Storage) cleanupExpiredEntries() {
 	}
 }
 
-func (n *Storage) Shutdown() error {
-	close(n.stopChan) // Signal all background tasks to stop
-	if err := n.walWriter.Close(); err != nil {
-		return fmt.Errorf("failed to close WAL: %v", err)
+func (s *Storage) Shutdown() error {
+	log.Println("Shutting down storage...")
+
+	// First close the WAL writer to ensure all entries are flushed
+	if s.walWriter != nil {
+		if err := s.walWriter.Close(); err != nil {
+			log.Printf("Error closing WAL writer: %v", err)
+			// Continue with shutdown even if there's an error
+		}
 	}
+
+	// Then close the stop channel
+	select {
+	case <-s.stopChan:
+		log.Println("Stop channel already closed")
+	default:
+		close(s.stopChan)
+	}
+
 	return nil
 }
 
@@ -842,3 +881,4 @@ func (n *Storage) GarbageCollect(key string) error {
 	}
 	return nil
 }
+

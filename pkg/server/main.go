@@ -37,6 +37,14 @@ type replicaResponse struct {
 	err       error
 }
 
+// Add a new type to track disconnected peers for reconnection attempts
+type disconnectedPeer struct {
+	nodeID      string
+	address     string
+	lastAttempt time.Time
+	attempts    int
+}
+
 // HLC represents a Hybrid Logical Clock
 type HLC struct {
 	mu           sync.Mutex
@@ -153,14 +161,19 @@ type server struct {
 	hlc *HLC
 
 	// Node management
-	peers     map[string]string                // Maps nodeID to address
-	clients   map[string]pb.NodeInternalClient // Internal clients for replication
-	kvClients map[string]pb.KVStoreClient      // KV clients for fetching data
+	peers              map[string]string                // Maps nodeID to address
+	clients            map[string]pb.NodeInternalClient // Internal clients for replication
+	kvClients          map[string]pb.KVStoreClient      // KV clients for fetching data
+	connections        map[string]*grpc.ClientConn      // Track the actual gRPC connections
+	disconnectedPeers  map[string]disconnectedPeer      // Tracks peers we couldn't connect to
+	disconnectedPeerMu sync.Mutex                       // Mutex for disconnected peers map
 
 	// Configuration
-	syncInterval      time.Duration
-	heartbeatInterval time.Duration
-	replicationFactor int
+	syncInterval         time.Duration
+	heartbeatInterval    time.Duration
+	replicationFactor    int
+	reconnectInterval    time.Duration // New setting for reconnect attempts
+	maxReconnectAttempts int           // Maximum number of reconnect attempts
 
 	stopChan chan struct{}
 
@@ -203,17 +216,21 @@ func NewServer(nodeID string, replicationFactor int, virtualNodes int) (*server,
 	hlc := NewHLC(uint32(numericID & 0xFFFFFFFF))
 
 	s := &server{
-		nodeID:            nodeID,
-		store:             store,
-		ring:              consistenthash.NewRing(virtualNodes),
-		peers:             make(map[string]string),
-		clients:           make(map[string]pb.NodeInternalClient),
-		kvClients:         make(map[string]pb.KVStoreClient),
-		syncInterval:      5 * time.Second,
-		heartbeatInterval: 1 * time.Second,
-		replicationFactor: replicationFactor,
-		stopChan:          make(chan struct{}),
-		hlc:               hlc,
+		nodeID:               nodeID,
+		store:                store,
+		ring:                 consistenthash.NewRing(virtualNodes),
+		peers:                make(map[string]string),
+		clients:              make(map[string]pb.NodeInternalClient),
+		kvClients:            make(map[string]pb.KVStoreClient),
+		connections:          make(map[string]*grpc.ClientConn),
+		disconnectedPeers:    make(map[string]disconnectedPeer),
+		syncInterval:         5 * time.Second,
+		heartbeatInterval:    1 * time.Second,
+		reconnectInterval:    5 * time.Second, // Try to reconnect every 5 seconds
+		maxReconnectAttempts: 20,              // Try to reconnect up to 20 times (100 seconds total)
+		replicationFactor:    replicationFactor,
+		stopChan:             make(chan struct{}),
+		hlc:                  hlc,
 		rebalanceConfig: RebalanceConfig{
 			BatchSize:     100,
 			BatchTimeout:  30 * time.Second,
@@ -252,6 +269,7 @@ func (s *server) gossipNewNode(newPeerID, newAddr string) {
 			log.Printf("Establishing connection with new node %s@%s", newPeerID, newAddr)
 			if err := s.addPeer(newPeerID, newAddr); err != nil {
 				log.Printf("Failed to connect to new node %s: %v", newPeerID, err)
+				// Even if connection fails, still try to gossip about it
 			}
 		}
 	}
@@ -297,6 +315,8 @@ func (s *server) AddNode(ctx context.Context, req *pb.AddNodeRequest) (*pb.Empty
 		// Forward this information to all other peers (except the one that sent it to us)
 		// This ensures full mesh connectivity
 		go s.gossipNewNode(req.NodeId, req.Addr)
+
+		go s.rebalanceRing()
 	}
 
 	return &pb.Empty{}, nil
@@ -312,17 +332,17 @@ func (s *server) addPeer(peerID string, addr string) error {
 	log.Printf("Adding peer %s at address %s", peerID, addr)
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	// Check if we already have this peer
 	if _, exists := s.peers[peerID]; exists {
 		log.Printf("Peer %s already exists in peer list", peerID)
+		s.mu.Unlock()
 		return nil
 	}
 
 	// Add to peer list and ring
 	s.peers[peerID] = addr
 	s.ring.AddNode(peerID)
+	s.mu.Unlock()
 
 	// Establish gRPC connection with retry logic
 	var conn *grpc.ClientConn
@@ -336,9 +356,17 @@ func (s *server) addPeer(peerID string, addr string) error {
 		time.Sleep(time.Second)
 	}
 	if err != nil {
-		// Remove from peers and ring if connection failed
-		delete(s.peers, peerID)
-		s.ring.RemoveNode(peerID)
+		// Don't remove from peers and ring immediately, add to disconnected peers for later retry
+		s.disconnectedPeerMu.Lock()
+		s.disconnectedPeers[peerID] = disconnectedPeer{
+			nodeID:      peerID,
+			address:     addr,
+			lastAttempt: time.Now(),
+			attempts:    1,
+		}
+		s.disconnectedPeerMu.Unlock()
+
+		log.Printf("Failed to connect to peer %s after retries, will attempt reconnection later", peerID)
 		return fmt.Errorf("failed to connect to peer %s after retries: %v", peerID, err)
 	}
 
@@ -348,12 +376,16 @@ func (s *server) addPeer(peerID string, addr string) error {
 
 	// Store in maps using consistent key (UUID without "node-" prefix)
 	mapKey := strings.TrimPrefix(peerID, "node-")
+
+	s.mu.Lock()
 	s.clients[mapKey] = internalClient
 	s.kvClients[mapKey] = kvClient
+	s.connections[mapKey] = conn // Store the connection
+	// Make sure it's in the ring
+	s.ring.AddNode(peerID)
+	s.mu.Unlock()
 
 	log.Printf("Successfully connected to peer %s", peerID)
-	log.Printf("Current ring state: %v", s.ring)
-
 	return nil
 }
 
@@ -1025,26 +1057,115 @@ func (s *server) Heartbeat(ctx context.Context, ping *pb.Ping) (*pb.Pong, error)
 
 // startHeartbeat periodically checks peer health
 func (s *server) startHeartbeat() {
-	ticker := time.NewTicker(s.heartbeatInterval)
+	heartbeatTicker := time.NewTicker(s.heartbeatInterval)
+	reconnectTicker := time.NewTicker(s.reconnectInterval)
+
 	go func() {
 		for {
 			select {
-			case <-ticker.C:
+			case <-heartbeatTicker.C:
 				s.checkPeers()
+			case <-reconnectTicker.C:
+				s.tryReconnectDisconnectedPeers()
 			case <-s.stopChan:
-				ticker.Stop()
+				heartbeatTicker.Stop()
+				reconnectTicker.Stop()
 				return
 			}
 		}
 	}()
 }
 
+// tryReconnectDisconnectedPeers attempts to reconnect to peers that were disconnected
+func (s *server) tryReconnectDisconnectedPeers() {
+	s.disconnectedPeerMu.Lock()
+	if len(s.disconnectedPeers) == 0 {
+		s.disconnectedPeerMu.Unlock()
+		return
+	}
+
+	// Create a copy of disconnected peers to work with without holding the lock
+	peersToTry := make([]disconnectedPeer, 0, len(s.disconnectedPeers))
+	for _, peer := range s.disconnectedPeers {
+		peersToTry = append(peersToTry, peer)
+	}
+	s.disconnectedPeerMu.Unlock()
+
+	log.Printf("Attempting to reconnect to %d disconnected peers", len(peersToTry))
+
+	for _, peer := range peersToTry {
+		// Check if we should stop trying to reconnect
+		if peer.attempts > s.maxReconnectAttempts {
+			log.Printf("Giving up on reconnecting to %s after %d attempts", peer.nodeID, peer.attempts)
+
+			s.disconnectedPeerMu.Lock()
+			delete(s.disconnectedPeers, peer.nodeID)
+			s.disconnectedPeerMu.Unlock()
+
+			// If we're giving up, ensure it's removed from the ring
+			s.mu.Lock()
+			delete(s.peers, peer.nodeID)
+			s.ring.RemoveNode(peer.nodeID)
+			s.mu.Unlock()
+
+			continue
+		}
+
+		// Try to establish the connection
+		conn, err := grpc.Dial(peer.address, grpc.WithInsecure())
+		if err != nil {
+			// Update the attempt count and last attempt time
+			s.disconnectedPeerMu.Lock()
+			updatedPeer := s.disconnectedPeers[peer.nodeID]
+			updatedPeer.attempts++
+			updatedPeer.lastAttempt = time.Now()
+			s.disconnectedPeers[peer.nodeID] = updatedPeer
+			s.disconnectedPeerMu.Unlock()
+
+			log.Printf("Reconnect attempt %d to %s failed: %v", peer.attempts, peer.nodeID, err)
+			continue
+		}
+
+		// Successfully reconnected
+		log.Printf("Successfully reconnected to peer %s at %s", peer.nodeID, peer.address)
+
+		// Create the clients
+		internalClient := pb.NewNodeInternalClient(conn)
+		kvClient := pb.NewKVStoreClient(conn)
+
+		mapKey := strings.TrimPrefix(peer.nodeID, "node-")
+
+		// Add to our connected clients
+		s.mu.Lock()
+		s.clients[mapKey] = internalClient
+		s.kvClients[mapKey] = kvClient
+		s.connections[mapKey] = conn // Store the connection
+		// Make sure it's in the ring
+		s.ring.AddNode(peer.nodeID)
+		s.mu.Unlock()
+
+		// Remove from disconnected peers
+		s.disconnectedPeerMu.Lock()
+		delete(s.disconnectedPeers, peer.nodeID)
+		s.disconnectedPeerMu.Unlock()
+
+		// Announce to other peers that we've reconnected with this peer
+		go s.gossipNewNode(peer.nodeID, peer.address)
+	}
+}
+
 // checkPeers sends heartbeat requests to all peers
 func (s *server) checkPeers() {
 	s.mu.RLock()
 	peers := make(map[string]pb.NodeInternalClient)
+	peerIDs := make(map[string]string) // Map from client ID to node ID
 	for id, client := range s.clients {
 		peers[id] = client
+		nodeID := id
+		if !strings.HasPrefix(id, "node-") {
+			nodeID = fmt.Sprintf("node-%s", id)
+		}
+		peerIDs[id] = nodeID
 	}
 	s.mu.RUnlock()
 
@@ -1058,28 +1179,56 @@ func (s *server) checkPeers() {
 
 		if err != nil {
 			log.Printf("Heartbeat failed for peer %s: %v", peerID, err)
-			s.handlePeerFailure(peerID)
+			s.handlePeerFailure(peerID, peerIDs[peerID])
 		}
 	}
 }
 
-// handlePeerFailure removes a failed peer and triggers rebalancing
-func (s *server) handlePeerFailure(peerID string) {
+// handlePeerFailure handles a failed peer temporarily, adding it to disconnected peers
+func (s *server) handlePeerFailure(peerID string, nodeID string) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	log.Printf("Handling failure of peer %s", peerID)
-	delete(s.peers, peerID)
-	delete(s.clients, peerID)
-
-	nodeID := peerID
-	if !strings.HasPrefix(peerID, "node-") {
-		nodeID = fmt.Sprintf("node-%s", peerID)
+	// Get the address of the peer before removing
+	addr, exists := s.peers[nodeID]
+	if !exists {
+		// If the node ID doesn't match, we need to look for the node ID differently
+		for nID, nAddr := range s.peers {
+			if strings.TrimPrefix(nID, "node-") == peerID {
+				addr = nAddr
+				nodeID = nID
+				exists = true
+				break
+			}
+		}
 	}
 
-	s.ring.RemoveNode(nodeID)
-	log.Printf("Removed node %s from ring", nodeID)
-	go s.rebalanceRing()
+	if !exists {
+		s.mu.Unlock()
+		log.Printf("Cannot find address for peer %s, cannot add to reconnection list", peerID)
+		return
+	}
+
+	// Close and remove the connection
+	if conn, exists := s.connections[peerID]; exists {
+		conn.Close()
+		delete(s.connections, peerID)
+	}
+
+	// Remove from active connections but not from peers list yet
+	delete(s.clients, peerID)
+	delete(s.kvClients, peerID)
+	s.mu.Unlock()
+
+	log.Printf("Marking peer %s as disconnected, will attempt to reconnect", nodeID)
+
+	// Add to disconnected peers list for reconnection attempts
+	s.disconnectedPeerMu.Lock()
+	s.disconnectedPeers[nodeID] = disconnectedPeer{
+		nodeID:      nodeID,
+		address:     addr,
+		lastAttempt: time.Now(),
+		attempts:    1,
+	}
+	s.disconnectedPeerMu.Unlock()
 }
 
 // Stop gracefully shuts down the server
@@ -1091,9 +1240,10 @@ func (s *server) Stop() {
 	}
 
 	s.mu.Lock()
-	for _, client := range s.clients {
-		if closer, ok := client.(interface{ Close() error }); ok {
-			_ = closer.Close()
+	// Close all gRPC connections properly
+	for id, conn := range s.connections {
+		if err := conn.Close(); err != nil {
+			log.Printf("Error closing connection to %s: %v", id, err)
 		}
 	}
 	s.mu.Unlock()

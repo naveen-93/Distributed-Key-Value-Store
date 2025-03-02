@@ -83,6 +83,7 @@ extern int kv_init(char** serverList);
 extern int kv_shutdown();
 extern int kv_get(char* cKey, char* cValue);
 extern int kv_put(char* cKey, char* cValue, char* cOldValue);
+extern int kv_delete(char* cKey);
 
 #ifdef __cplusplus
 }
