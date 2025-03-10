@@ -6,11 +6,12 @@ import (
 	"log"
 	"os"
 	"os/exec"
-	"strings"
 	"testing"
 	"time"
 
 	"Distributed-Key-Value-Store/pkg/client"
+
+	"strings"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -30,7 +31,7 @@ func TestMain(m *testing.M) {
 	}
 
 	// Wait for servers to initialize
-	time.Sleep(3 * time.Second)
+	time.Sleep(30 * time.Second)
 
 	// Run tests
 	exitCode := m.Run()
@@ -43,42 +44,50 @@ func TestMain(m *testing.M) {
 
 // startServers launches the required number of server instances
 func startServers() error {
-	serverIDs := []string{
-		"12345678-1234-5678-1234-567812345678", // Node 1
-		"87654321-4321-8765-4321-876543210987", // Node 2
-		"11112222-3333-4444-5555-666677778888", // Node 3
+	nodeIDs := []string{
+		"node1", // Node 1
+		"node2", // Node 2
+		"node3", // Node 3
 	}
 
 	for i := 0; i < numServers; i++ {
 		port := basePort + i
-		nodeID := serverIDs[i]
+		nodeID := nodeIDs[i]
 		addr := fmt.Sprintf(":%d", port)
 
 		// Build a list of peer addresses for this server
-		var peerList []string
-		for j := 0; j < numServers; j++ {
-			if j != i { // Don't include self as peer
-				peerNodeID := serverIDs[j]
+		var peerArgs string
+		if i > 0 {
+			var peers []string
+			for j := 0; j < i; j++ {
+				peerNodeID := nodeIDs[j]
 				peerAddr := fmt.Sprintf("localhost:%d", basePort+j)
-				peerList = append(peerList, fmt.Sprintf("%s@%s", peerNodeID, peerAddr))
+				peers = append(peers, fmt.Sprintf("%s@%s", peerNodeID, peerAddr))
 			}
+			// Optionally include self for the third server as shown in the example
+			if i == 2 {
+				peerNodeID := nodeIDs[i]
+				peerAddr := fmt.Sprintf("localhost:%d", port)
+				peers = append(peers, fmt.Sprintf("%s@%s", peerNodeID, peerAddr))
+			}
+			peerArgs = fmt.Sprintf("-peers \"%s\"", strings.Join(peers, ","))
 		}
 
-		// Combine all arguments
-		args := []string{"run", "../pkg/server/main.go",
-			"--id", nodeID,
-			"--addr", addr,
-			"--replication-factor", "3",
-			"--peers", strings.Join(peerList, ",")}
-		cmd := exec.Command("go", args...)
-
-		// Redirect output to /dev/null instead of stdout/stderr
-		devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
-		if err != nil {
-			return fmt.Errorf("failed to open /dev/null: %v", err)
+		// Build the command based on the requested format
+		cmdString := fmt.Sprintf("go run pkg/server/main.go -addr %s -id %s", addr, nodeID)
+		if peerArgs != "" {
+			cmdString += " " + peerArgs
 		}
-		cmd.Stdout = devNull
-		cmd.Stderr = devNull
+
+		// Add replication factor if needed (keeping from original)
+		cmdString += " -replication-factor 2"
+
+		// Split the command string into parts for exec.Command
+		args := strings.Fields(cmdString)
+		cmd := exec.Command(args[0], args[1:]...)
+
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
 
 		if err := cmd.Start(); err != nil {
 			stopServers() // Clean up any servers that did start
@@ -86,7 +95,7 @@ func startServers() error {
 		}
 
 		serverProcesses = append(serverProcesses, cmd)
-		log.Printf("Started server %d with ID %s on %s with peers %v", i+1, nodeID, addr, peerList)
+		log.Printf("Started server %d with ID %s on %s with command: %s", i+1, nodeID, addr, cmdString)
 	}
 
 	return nil
@@ -206,11 +215,6 @@ func TestConsistency(t *testing.T) {
 
 // TestFaultTolerance verifies that the system can handle node failures
 func TestFaultTolerance(t *testing.T) {
-	// Skip the test if no servers are running
-	if len(serverProcesses) == 0 {
-		t.Skip("No server processes available, skipping test")
-	}
-
 	// Create client
 	cfg := client.ClientConfig{
 		ServerAddresses: getServerAddresses(),
@@ -315,27 +319,34 @@ func TestReadRepair(t *testing.T) {
 
 	// Restart the killed server
 	port := basePort + serverToKill
-	nodeID := fmt.Sprintf("%d", serverToKill+1)
-	addr := fmt.Sprintf("localhost:%d", port)
+	nodeID := fmt.Sprintf("node%d", serverToKill+1)
+	addr := fmt.Sprintf(":%d", port)
 
-	// Build peer arguments
-	var peerArgs []string
+	// Build peer arguments following the format in the example
+	var peerArgs string
+	var peers []string
 	for j := 0; j < numServers; j++ {
 		if j != serverToKill {
-			peerNodeID := fmt.Sprintf("%d", j+1)
+			peerNodeID := fmt.Sprintf("node%d", j+1)
 			peerAddr := fmt.Sprintf("localhost:%d", basePort+j)
-			peerArgs = append(peerArgs, fmt.Sprintf("--peers=%s@%s", peerNodeID, peerAddr))
+			peers = append(peers, fmt.Sprintf("%s@%s", peerNodeID, peerAddr))
 		}
 	}
 
-	// Combine all arguments
-	args := []string{"run", "../pkg/server/main.go",
-		"--id", nodeID,
-		"--addr", addr,
-		"--replication-factor", "2"}
-	args = append(args, peerArgs...)
+	if len(peers) > 0 {
+		peerArgs = fmt.Sprintf("-peers \"%s\"", strings.Join(peers, ","))
+	}
 
-	cmd := exec.Command("go", args...)
+	// Build the command string
+	cmdString := fmt.Sprintf("go run pkg/server/main.go -addr %s -id %s", addr, nodeID)
+	if peerArgs != "" {
+		cmdString += " " + peerArgs
+	}
+	cmdString += " -replication-factor 2"
+
+	// Split the command string for exec.Command
+	args := strings.Fields(cmdString)
+	cmd := exec.Command(args[0], args[1:]...)
 
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -344,7 +355,7 @@ func TestReadRepair(t *testing.T) {
 		t.Fatalf("Failed to restart server: %v", err)
 	}
 	serverProcesses[serverToKill] = cmd
-	log.Printf("Restarted server %d", serverToKill+1)
+	log.Printf("Restarted server %d with command: %s", serverToKill+1, cmdString)
 
 	// Wait for the server to initialize
 	time.Sleep(3 * time.Second)
@@ -352,7 +363,7 @@ func TestReadRepair(t *testing.T) {
 	// The restarted server should have the old value
 	// Create a new client for the restarted server
 	cfg = client.ClientConfig{
-		ServerAddresses: []string{addr},
+		ServerAddresses: []string{fmt.Sprintf("localhost:%d", port)},
 		Timeout:         5 * time.Second,
 		RetryAttempts:   3,
 		RetryDelay:      500 * time.Millisecond,

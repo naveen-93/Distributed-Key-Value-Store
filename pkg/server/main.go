@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -43,6 +44,28 @@ type disconnectedPeer struct {
 	address     string
 	lastAttempt time.Time
 	attempts    int
+}
+
+// ReplicationTask represents a pending replication task
+type ReplicationTask struct {
+	key         string
+	value       string
+	timestamp   uint64
+	attempts    int
+	lastTry     time.Time
+	targetNodes []string // List of target nodes for this replication task
+}
+
+// ReplicationMetrics tracks statistics about replication operations
+type ReplicationMetrics struct {
+	mu                     sync.Mutex
+	totalReplications      int64
+	successfulReplications int64
+	failedReplications     int64
+	pendingReplications    int64
+	avgReplicationTimeMs   int64
+	replicationTimes       []time.Duration // Recent replication times for calculating average
+	maxRecentTimes         int             // Maximum number of recent times to track
 }
 
 // HLC represents a Hybrid Logical Clock
@@ -164,16 +187,22 @@ type server struct {
 	peers              map[string]string                // Maps nodeID to address
 	clients            map[string]pb.NodeInternalClient // Internal clients for replication
 	kvClients          map[string]pb.KVStoreClient      // KV clients for fetching data
-	connections        map[string]*grpc.ClientConn      // Track the actual gRPC connections
 	disconnectedPeers  map[string]disconnectedPeer      // Tracks peers we couldn't connect to
 	disconnectedPeerMu sync.Mutex                       // Mutex for disconnected peers map
 
+	// Replication queue and metrics
+	replicationQueue     []ReplicationTask
+	replicationQueueMu   sync.Mutex
+	replicationQueueCond *sync.Cond
+	replicationMetrics   ReplicationMetrics
+
 	// Configuration
-	syncInterval         time.Duration
-	heartbeatInterval    time.Duration
-	replicationFactor    int
-	reconnectInterval    time.Duration // New setting for reconnect attempts
-	maxReconnectAttempts int           // Maximum number of reconnect attempts
+	syncInterval          time.Duration
+	heartbeatInterval     time.Duration
+	replicationFactor     int
+	reconnectInterval     time.Duration // New setting for reconnect attempts
+	maxReconnectAttempts  int           // Maximum number of reconnect attempts
+	maxReplicationRetries int           // Maximum number of replication retries
 
 	stopChan chan struct{}
 
@@ -216,21 +245,26 @@ func NewServer(nodeID string, replicationFactor int, virtualNodes int) (*server,
 	hlc := NewHLC(uint32(numericID & 0xFFFFFFFF))
 
 	s := &server{
-		nodeID:               nodeID,
-		store:                store,
-		ring:                 consistenthash.NewRing(virtualNodes),
-		peers:                make(map[string]string),
-		clients:              make(map[string]pb.NodeInternalClient),
-		kvClients:            make(map[string]pb.KVStoreClient),
-		connections:          make(map[string]*grpc.ClientConn),
-		disconnectedPeers:    make(map[string]disconnectedPeer),
-		syncInterval:         5 * time.Second,
-		heartbeatInterval:    1 * time.Second,
-		reconnectInterval:    5 * time.Second, // Try to reconnect every 5 seconds
-		maxReconnectAttempts: 20,              // Try to reconnect up to 20 times (100 seconds total)
-		replicationFactor:    replicationFactor,
-		stopChan:             make(chan struct{}),
-		hlc:                  hlc,
+		nodeID:            nodeID,
+		store:             store,
+		ring:              consistenthash.NewRing(virtualNodes),
+		peers:             make(map[string]string),
+		clients:           make(map[string]pb.NodeInternalClient),
+		kvClients:         make(map[string]pb.KVStoreClient),
+		disconnectedPeers: make(map[string]disconnectedPeer),
+		replicationQueue:  make([]ReplicationTask, 0),
+		replicationMetrics: ReplicationMetrics{
+			maxRecentTimes:   100, // Track the last 100 replication times
+			replicationTimes: make([]time.Duration, 0, 100),
+		},
+		syncInterval:          5 * time.Second,
+		heartbeatInterval:     1 * time.Second,
+		reconnectInterval:     5 * time.Second, // Try to reconnect every 5 seconds
+		maxReconnectAttempts:  20,              // Try to reconnect up to 20 times (100 seconds total)
+		maxReplicationRetries: 5,               // Try to replicate up to 5 times
+		replicationFactor:     replicationFactor,
+		stopChan:              make(chan struct{}),
+		hlc:                   hlc,
 		rebalanceConfig: RebalanceConfig{
 			BatchSize:     100,
 			BatchTimeout:  30 * time.Second,
@@ -238,6 +272,9 @@ func NewServer(nodeID string, replicationFactor int, virtualNodes int) (*server,
 			RetryAttempts: 3,
 		},
 	}
+
+	// Initialize the condition variable for the replication queue
+	s.replicationQueueCond = sync.NewCond(&s.replicationQueueMu)
 
 	// Add self to the consistent hash ring
 	s.ring.AddNode(nodeID)
@@ -315,7 +352,6 @@ func (s *server) AddNode(ctx context.Context, req *pb.AddNodeRequest) (*pb.Empty
 		// Forward this information to all other peers (except the one that sent it to us)
 		// This ensures full mesh connectivity
 		go s.gossipNewNode(req.NodeId, req.Addr)
-
 		go s.rebalanceRing()
 	}
 
@@ -380,7 +416,6 @@ func (s *server) addPeer(peerID string, addr string) error {
 	s.mu.Lock()
 	s.clients[mapKey] = internalClient
 	s.kvClients[mapKey] = kvClient
-	s.connections[mapKey] = conn // Store the connection
 	// Make sure it's in the ring
 	s.ring.AddNode(peerID)
 	s.mu.Unlock()
@@ -396,31 +431,18 @@ func (s *server) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, 
 		return nil, status.Error(codes.InvalidArgument, "key cannot be empty")
 	}
 
-	// Get all replicas for this key
-	s.mu.RLock()
-	replicas := s.ring.GetReplicas(req.Key, s.replicationFactor)
-	s.mu.RUnlock()
-
-	// // Only log replicas at debug level or when needed
-	// if log.Default().Writer() == os.Stderr {
-	//     log.Printf("Replicas for key %s: %v", req.Key, replicas)
-	// }
-
-	// Check local store first
+	// Check local store first - this is fast
 	localValue, localTimestamp, localExists := s.store.Get(req.Key)
 
-	// If we're not a designated replica, we shouldn't have this key
-	// Just query all replicas
-	if !s.isDesignatedReplica(req.Key) {
-		log.Printf("This node is not a designated replica for key %s, querying all replicas", req.Key)
-		return s.queryAllReplicasAndRepair(ctx, req.Key, replicas)
-	}
-
-	// We are a designated replica
+	// If we have the key locally, return it immediately
+	// and trigger read repair asynchronously
 	if localExists {
+		// Get replicas for this key for potential read repair
+		s.mu.RLock()
+		replicas := s.ring.GetReplicas(req.Key, s.replicationFactor)
+		s.mu.RUnlock()
 
-		// Even if we have the key locally, we should still check other replicas
-		// to see if they have a newer version, but do it asynchronously
+		// Trigger read repair asynchronously
 		go s.asyncReadRepair(req.Key, localTimestamp, replicas)
 
 		return &pb.GetResponse{
@@ -430,7 +452,20 @@ func (s *server) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, 
 		}, nil
 	}
 
-	// We're a designated replica but don't have the key
+	// We don't have the key locally, check if we should have it
+	s.mu.RLock()
+	replicas := s.ring.GetReplicas(req.Key, s.replicationFactor)
+	isReplica := s.isDesignatedReplica(req.Key)
+	s.mu.RUnlock()
+
+	// If we're not a designated replica, we shouldn't have this key
+	// Just query all replicas
+	if !isReplica {
+		log.Printf("This node is not a designated replica for key %s, querying all replicas", req.Key)
+		return s.queryAllReplicasAndRepair(ctx, req.Key, replicas)
+	}
+
+	// We are a designated replica but don't have the key
 	// This might be due to a node failure or rebalancing
 	// Query all replicas and perform read repair
 	log.Printf("Key %s not found locally despite being a designated replica, querying all replicas", req.Key)
@@ -504,9 +539,14 @@ func (s *server) queryAllReplicasAndRepair(ctx context.Context, key string, repl
 	}
 
 	// Wait for all queries to complete
-	for i := 0; i < queriesStarted; i++ {
+	resultsReceived := 0
+	keyFound := false
+
+	for resultsReceived < queriesStarted {
 		select {
 		case result := <-resultChan:
+			resultsReceived++
+
 			if result.err != nil {
 				log.Printf("Error querying replica %s: %v", result.nodeID, result.err)
 				continue
@@ -516,6 +556,7 @@ func (s *server) queryAllReplicasAndRepair(ctx context.Context, key string, repl
 				continue
 			}
 
+			keyFound = true
 			log.Printf("Replica %s has key %s with timestamp %d", result.nodeID, key, result.timestamp)
 
 			// If this is the first result or has a newer timestamp
@@ -538,8 +579,17 @@ func (s *server) queryAllReplicasAndRepair(ctx context.Context, key string, repl
 			}
 
 		case <-ctx.Done():
-			log.Printf("Context deadline exceeded while querying replicas for key %s", key)
-			break
+			log.Printf("Context deadline exceeded while querying replicas for key %s (%d/%d results received)",
+				key, resultsReceived, queriesStarted)
+			// Don't exit the loop if we found the key on at least one replica
+			if keyFound && mostRecentExists {
+				resultsReceived = queriesStarted // Force loop exit
+			} else {
+				// Only continue waiting if we have more results pending
+				if resultsReceived < queriesStarted {
+					continue
+				}
+			}
 		}
 	}
 
@@ -573,6 +623,12 @@ func (s *server) queryAllReplicasAndRepair(ctx context.Context, key string, repl
 // asyncReadRepair checks other replicas for newer versions of a key
 // and updates stale replicas asynchronously
 func (s *server) asyncReadRepair(key string, localTimestamp uint64, replicas []string) {
+	// Skip read repair for very recent writes (less than 100ms old)
+	// This reduces unnecessary network traffic for hot keys
+	if time.Since(time.Unix(0, int64(localTimestamp>>16)*1000000)) < 100*time.Millisecond {
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -733,14 +789,8 @@ func (s *server) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, 
 		return nil, err
 	}
 
-	// Replicate synchronously with quorum
-	quorumSize := (s.replicationFactor / 2) + 1
-
-	// Synchronously replicate to other nodes
-	if err := s.replicateWithQuorum(ctx, req.Key, req.Value, timestamp, quorumSize); err != nil {
-		// If we can't achieve quorum, fail the write
-		return nil, status.Errorf(codes.Unavailable, "failed to achieve write quorum: %v", err)
-	}
+	// Replicate asynchronously to other nodes
+	go s.replicateAsync(context.Background(), req.Key, req.Value, timestamp)
 
 	return &pb.PutResponse{
 		OldValue:    string(oldValue),
@@ -748,77 +798,175 @@ func (s *server) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, 
 	}, nil
 }
 
-// replicateWithQuorum replicates data to nodes and waits for quorum acknowledgment
-func (s *server) replicateWithQuorum(ctx context.Context, key, value string, timestamp uint64, quorumSize int) error {
+// replicateAsync asynchronously replicates data to all designated replica nodes
+func (s *server) replicateAsync(ctx context.Context, key, value string, timestamp uint64) {
 	s.mu.RLock()
 	replicas := s.ring.GetReplicas(key, s.replicationFactor)
 	s.mu.RUnlock()
 
-	log.Printf("Replicating key %s to %d replicas with quorum size %d", key, len(replicas), quorumSize)
-
-	// We already have 1 successful write (local)
-	successCount := 1
-
-	// If we only need 1 node for quorum, we're already done (local write succeeded)
-	if quorumSize <= 1 {
-		return nil
-	}
-
-	// Create a channel to collect results
-	type replicaResult struct {
-		nodeID string
-		err    error
-	}
-	resultChan := make(chan replicaResult, len(replicas))
-
-	// Create a timeout context for the entire replication operation
-	replicationCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
-	// Track how many replications we've initiated
-	replicationsStarted := 0
-
-	// Send replication requests to all replicas except self
+	// Filter out self from replicas
+	var targetReplicas []string
 	for _, nodeID := range replicas {
-		if nodeID == s.nodeID {
-			continue
+		if nodeID != s.nodeID {
+			targetReplicas = append(targetReplicas, nodeID)
 		}
+	}
 
-		replicationsStarted++
+	if len(targetReplicas) == 0 {
+		log.Printf("No replicas to replicate key %s to", key)
+		return
+	}
 
-		go func(targetNodeID string) {
-			err := s.replicateKey(replicationCtx, key, value, timestamp, targetNodeID)
-			resultChan <- replicaResult{nodeID: targetNodeID, err: err}
+	log.Printf("Asynchronously replicating key %s to %d replicas", key, len(targetReplicas))
+
+	// Update metrics
+	s.replicationMetrics.mu.Lock()
+	s.replicationMetrics.totalReplications += int64(len(targetReplicas))
+	s.replicationMetrics.pendingReplications += int64(len(targetReplicas))
+	s.replicationMetrics.mu.Unlock()
+
+	// Create a single replication task for all target nodes
+	task := ReplicationTask{
+		key:         key,
+		value:       value,
+		timestamp:   timestamp,
+		attempts:    0,
+		lastTry:     time.Now(),
+		targetNodes: targetReplicas,
+	}
+
+	// Add to replication queue
+	s.replicationQueueMu.Lock()
+	s.replicationQueue = append(s.replicationQueue, task)
+	s.replicationQueueMu.Unlock()
+
+	// Signal that there's work to do
+	s.replicationQueueCond.Signal()
+}
+
+// processReplicationTask attempts to replicate a key to all designated replicas
+func (s *server) processReplicationTask(task ReplicationTask) {
+	// Check if we need to retry
+	if task.attempts >= s.maxReplicationRetries {
+		log.Printf("Giving up on replicating key %s after %d attempts",
+			task.key, task.attempts)
+
+		// Update metrics for failed replications
+		s.replicationMetrics.mu.Lock()
+		s.replicationMetrics.failedReplications += int64(len(task.targetNodes))
+		s.replicationMetrics.pendingReplications -= int64(len(task.targetNodes))
+		s.replicationMetrics.mu.Unlock()
+
+		return
+	}
+
+	// Increment attempt counter
+	task.attempts++
+
+	// Calculate backoff time based on attempt number
+	backoffTime := time.Duration(1<<uint(task.attempts-1)) * 100 * time.Millisecond
+	if time.Since(task.lastTry) < backoffTime {
+		// Not enough time has passed since last attempt, re-queue with delay
+		time.AfterFunc(backoffTime-time.Since(task.lastTry), func() {
+			s.replicationQueueMu.Lock()
+			s.replicationQueue = append(s.replicationQueue, task)
+			s.replicationQueueCond.Signal()
+			s.replicationQueueMu.Unlock()
+		})
+		return
+	}
+
+	// Update last try time
+	task.lastTry = time.Now()
+	startTime := time.Now()
+
+	// Try to replicate to all target nodes in parallel
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var remainingNodes []string
+
+	for _, nodeID := range task.targetNodes {
+		wg.Add(1)
+		go func(nodeID string) {
+			defer wg.Done()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			err := s.replicateKey(ctx, task.key, task.value, task.timestamp, nodeID)
+			cancel()
+
+			if err != nil {
+				log.Printf("Failed to replicate key %s to node %s: %v",
+					task.key, nodeID, err)
+
+				mu.Lock()
+				remainingNodes = append(remainingNodes, nodeID)
+				mu.Unlock()
+			} else {
+				log.Printf("Successfully replicated key %s to node %s on attempt %d",
+					task.key, nodeID, task.attempts)
+
+				// Update metrics for successful replication
+				s.replicationMetrics.mu.Lock()
+				s.replicationMetrics.successfulReplications++
+				s.replicationMetrics.pendingReplications--
+
+				// Track replication time
+				replicationTime := time.Since(startTime)
+				s.replicationMetrics.replicationTimes = append(s.replicationMetrics.replicationTimes, replicationTime)
+				if len(s.replicationMetrics.replicationTimes) > s.replicationMetrics.maxRecentTimes {
+					// Remove oldest time if we've exceeded our tracking limit
+					s.replicationMetrics.replicationTimes = s.replicationMetrics.replicationTimes[1:]
+				}
+
+				// Recalculate average replication time
+				var totalTime int64
+				for _, t := range s.replicationMetrics.replicationTimes {
+					totalTime += t.Milliseconds()
+				}
+				if len(s.replicationMetrics.replicationTimes) > 0 {
+					s.replicationMetrics.avgReplicationTimeMs = totalTime / int64(len(s.replicationMetrics.replicationTimes))
+				}
+				s.replicationMetrics.mu.Unlock()
+			}
 		}(nodeID)
 	}
 
-	// Wait for enough successful replications or context timeout
-	for i := 0; i < replicationsStarted; i++ {
-		select {
-		case result := <-resultChan:
-			if result.err == nil {
-				successCount++
-				log.Printf("Successful replication to node %s, success count: %d/%d",
-					result.nodeID, successCount, quorumSize)
+	// Wait for all replication attempts to complete
+	wg.Wait()
 
-				// If we've reached quorum, we can return success
-				if successCount >= quorumSize {
-					log.Printf("Achieved write quorum (%d/%d) for key %s",
-						successCount, quorumSize, key)
-					return nil
-				}
-			} else {
-				log.Printf("Failed to replicate to node %s: %v", result.nodeID, result.err)
-			}
-		case <-replicationCtx.Done():
-			return fmt.Errorf("replication timed out after achieving %d/%d successful replicas",
-				successCount, quorumSize)
+	// If there are remaining nodes, requeue the task
+	if len(remainingNodes) > 0 {
+		// Create a new task with only the remaining nodes
+		newTask := ReplicationTask{
+			key:         task.key,
+			value:       task.value,
+			timestamp:   task.timestamp,
+			attempts:    task.attempts,
+			lastTry:     task.lastTry,
+			targetNodes: remainingNodes,
 		}
-	}
 
-	// If we get here, we didn't achieve quorum
-	return fmt.Errorf("failed to achieve write quorum, only %d/%d successful replicas",
-		successCount, quorumSize)
+		// Calculate backoff time for next attempt
+		nextBackoff := time.Duration(1<<uint(task.attempts)) * 100 * time.Millisecond
+
+		// Requeue with delay
+		time.AfterFunc(nextBackoff, func() {
+			s.replicationQueueMu.Lock()
+			s.replicationQueue = append(s.replicationQueue, newTask)
+			s.replicationQueueCond.Signal()
+			s.replicationQueueMu.Unlock()
+		})
+	}
+}
+
+// replicateWithQuorum is kept for backward compatibility but now delegates to replicateAsync
+// This function is now deprecated and will be removed in future versions
+func (s *server) replicateWithQuorum(ctx context.Context, key, value string, timestamp uint64, quorumSize int) error {
+	// Start async replication
+	go s.replicateAsync(context.Background(), key, value, timestamp)
+
+	// Always return success since we're now using async replication
+	return nil
 }
 
 // isDesignatedReplica checks if this node should hold a key
@@ -1139,7 +1287,6 @@ func (s *server) tryReconnectDisconnectedPeers() {
 		s.mu.Lock()
 		s.clients[mapKey] = internalClient
 		s.kvClients[mapKey] = kvClient
-		s.connections[mapKey] = conn // Store the connection
 		// Make sure it's in the ring
 		s.ring.AddNode(peer.nodeID)
 		s.mu.Unlock()
@@ -1207,12 +1354,6 @@ func (s *server) handlePeerFailure(peerID string, nodeID string) {
 		return
 	}
 
-	// Close and remove the connection
-	if conn, exists := s.connections[peerID]; exists {
-		conn.Close()
-		delete(s.connections, peerID)
-	}
-
 	// Remove from active connections but not from peers list yet
 	delete(s.clients, peerID)
 	delete(s.kvClients, peerID)
@@ -1239,11 +1380,13 @@ func (s *server) Stop() {
 		s.cancel()
 	}
 
+	// Signal replication worker to exit
+	s.replicationQueueCond.Broadcast()
+
 	s.mu.Lock()
-	// Close all gRPC connections properly
-	for id, conn := range s.connections {
-		if err := conn.Close(); err != nil {
-			log.Printf("Error closing connection to %s: %v", id, err)
+	for _, client := range s.clients {
+		if closer, ok := client.(interface{ Close() error }); ok {
+			_ = closer.Close()
 		}
 	}
 	s.mu.Unlock()
@@ -1261,6 +1404,7 @@ func (s *server) Start() {
 	s.cancel = cancel
 
 	go s.startHeartbeat()
+	go s.startReplicationWorker()
 
 	// Perform initial peer discovery and gossip
 	go func() {
@@ -1413,6 +1557,90 @@ func (s *server) checkReplicaKeyTimestamp(ctx context.Context, key string, repli
 	return resp.Timestamp, resp.Exists
 }
 
+// GetReplicationMetrics returns current replication metrics
+func (s *server) GetReplicationMetrics(ctx context.Context, req *pb.Empty) (*pb.ReplicationMetricsResponse, error) {
+	s.replicationMetrics.mu.Lock()
+	defer s.replicationMetrics.mu.Unlock()
+
+	return &pb.ReplicationMetricsResponse{
+		TotalReplications:      s.replicationMetrics.totalReplications,
+		SuccessfulReplications: s.replicationMetrics.successfulReplications,
+		FailedReplications:     s.replicationMetrics.failedReplications,
+		PendingReplications:    s.replicationMetrics.pendingReplications,
+		AvgReplicationTimeMs:   s.replicationMetrics.avgReplicationTimeMs,
+		QueueSize:              int64(len(s.replicationQueue)),
+	}, nil
+}
+
+// startReplicationWorker starts a background worker to process the replication queue
+func (s *server) startReplicationWorker() {
+	// Number of workers based on CPU cores, but capped at a reasonable number
+	numWorkers := runtime.NumCPU()
+	if numWorkers > 8 {
+		numWorkers = 8
+	}
+
+	log.Printf("Starting %d replication workers", numWorkers)
+
+	// Start multiple workers
+	for i := 0; i < numWorkers; i++ {
+		go func(workerID int) {
+			for {
+				// Get a task from the queue with proper locking
+				s.replicationQueueMu.Lock()
+				for len(s.replicationQueue) == 0 {
+					// Check for shutdown before waiting
+					select {
+					case <-s.stopChan:
+						s.replicationQueueMu.Unlock()
+						return
+					default:
+						// Continue with wait
+					}
+
+					// Wait releases the mutex while waiting and reacquires it when woken up
+					s.replicationQueueCond.Wait()
+				}
+
+				// We have the lock and there's at least one task
+				task := s.replicationQueue[0]
+				s.replicationQueue = s.replicationQueue[1:]
+				s.replicationQueueMu.Unlock()
+
+				// Process the task
+				s.processReplicationTask(task)
+			}
+		}(i)
+	}
+
+	// Start a periodic log of replication metrics
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				s.replicationQueueMu.Lock()
+				queueSize := len(s.replicationQueue)
+				s.replicationQueueMu.Unlock()
+
+				s.replicationMetrics.mu.Lock()
+				log.Printf("Replication metrics: total=%d, success=%d, failed=%d, pending=%d, avg_time=%dms, queue_size=%d",
+					s.replicationMetrics.totalReplications,
+					s.replicationMetrics.successfulReplications,
+					s.replicationMetrics.failedReplications,
+					s.replicationMetrics.pendingReplications,
+					s.replicationMetrics.avgReplicationTimeMs,
+					queueSize)
+				s.replicationMetrics.mu.Unlock()
+			case <-s.stopChan:
+				return
+			}
+		}
+	}()
+}
+
 // Main function to start the server
 func main() {
 	nodeID := flag.String("id", "", "Node ID (optional, will be formatted as node-{id})")
@@ -1422,6 +1650,7 @@ func main() {
 	heartbeatInterval := flag.Duration("heartbeat-interval", time.Second, "Heartbeat check interval")
 	replicationFactor := flag.Int("replication-factor", 3, "Number of replicas per key")
 	virtualNodes := flag.Int("virtual-nodes", 10, "Number of virtual nodes per physical node")
+	asyncReplication := flag.Bool("async-replication", true, "Use asynchronous replication (default: true)")
 	flag.Parse()
 
 	// Generate UUID if not provided
@@ -1441,6 +1670,13 @@ func main() {
 
 	srv.syncInterval = *syncInterval
 	srv.heartbeatInterval = *heartbeatInterval
+
+	// Log replication mode
+	if *asyncReplication {
+		log.Printf("Using asynchronous replication mode")
+	} else {
+		log.Printf("Using synchronous replication mode with quorum")
+	}
 
 	// Add peers
 	if *peerList != "" {

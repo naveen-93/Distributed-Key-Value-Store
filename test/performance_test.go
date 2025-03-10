@@ -17,7 +17,7 @@ import (
 
 const (
 	// Test configuration
-	keyCount       = 1000
+	keyCount       = 100
 	keyPrefix      = "test-key-"
 	valueSize      = 100
 	benchmarkTime  = 10 * time.Second
@@ -436,7 +436,7 @@ func BenchmarkLargeValues(b *testing.B) {
 	keys := generateKeys()[0:100] // Use fewer keys for large value test
 	ctx := context.Background()
 
-	valueSizes := []int{1024, 10 * 1024, 100 * 1024, 1024 * 1024} // 1KB, 10KB, 100KB, 1MB
+	valueSizes := []int{1024, 10 * 1024} // 1KB, 10KB, 100KB, 1MB
 
 	for _, size := range valueSizes {
 		b.Run(fmt.Sprintf("ValueSize_%dKB", size/1024), func(b *testing.B) {

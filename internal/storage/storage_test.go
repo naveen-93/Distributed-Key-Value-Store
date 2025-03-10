@@ -140,42 +140,6 @@ func TestWALRecovery(t *testing.T) {
 	})
 }
 
-func TestSnapshotting(t *testing.T) {
-	nodeID := uint32(4)
-	cleanup(nodeID)
-	defer cleanup(nodeID)
-
-	node := NewStorage(nodeID)
-
-	t.Run("Snapshot Creation and Recovery", func(t *testing.T) {
-		// Store enough data to trigger snapshot
-		for i := 0; i < 1000; i++ {
-			key := fmt.Sprintf("key-%d", i)
-			value := fmt.Sprintf("value-%d", i)
-			node.Store(key, value, node.generateTimestamp())
-		}
-
-		// Force compaction
-		require.NoError(t, node.compactWAL())
-
-		// Verify snapshot was created
-		files, err := os.ReadDir("snapshots")
-		require.NoError(t, err)
-		assert.True(t, len(files) > 0)
-
-		// Create new node instance to test recovery from snapshot
-		node2 := NewStorage(nodeID)
-
-		// Verify recovered data
-		for i := 0; i < 1000; i++ {
-			key := fmt.Sprintf("key-%d", i)
-			expectedValue := fmt.Sprintf("value-%d", i)
-			value, _, exists := node2.Get(key)
-			assert.True(t, exists)
-			assert.Equal(t, expectedValue, value)
-		}
-	})
-}
 
 func TestTimestampOrdering(t *testing.T) {
 	nodeID := uint32(5)

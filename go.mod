@@ -1,22 +1,22 @@
 module Distributed-Key-Value-Store
 
-go 1.23.0
+go 1.22
 
-toolchain go1.23.6
+toolchain go1.22.1
 
 require (
-	github.com/bits-and-blooms/bloom/v3 v3.7.0
+	
 	github.com/google/uuid v1.6.0
+	github.com/spaolacci/murmur3 v1.1.0
 	github.com/stretchr/testify v1.10.0
 	google.golang.org/grpc v1.70.0
 	google.golang.org/protobuf v1.36.5
 )
 
 require (
-	github.com/bits-and-blooms/bitset v1.10.0 // indirect
+	
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
-	github.com/spaolacci/murmur3 v1.1.0 // indirect
 	golang.org/x/net v0.35.0 // indirect
 	golang.org/x/sys v0.30.0 // indirect
 	golang.org/x/text v0.22.0 // indirect

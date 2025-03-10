@@ -202,12 +202,27 @@ func (r *Ring) GetReplicas(key string, n int) []string {
 		n = uniqueNodeCount
 	}
 
+	// If we only need one replica, we can optimize by just returning the primary node
+	if n == 1 {
+		hash := r.HashKey(key)
+		idx := r.search(hash)
+		if idx >= len(r.hashRing) {
+			idx = 0
+		}
+		return []string{r.mapping[r.hashRing[idx]]}
+	}
+
+	// For small n, preallocate the exact size
+	replicas := make([]string, 0, n)
+	seenNodes := make(map[string]bool, n)
+
 	hash := r.HashKey(key)
-	var replicas []string
-	seenNodes := make(map[string]bool)
 
 	// Find the starting point in the ring
 	startIdx := r.search(hash)
+	if startIdx >= len(r.hashRing) {
+		startIdx = 0
+	}
 
 	// Collect n unique nodes, starting from the position after hash
 	idx := startIdx

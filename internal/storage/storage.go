@@ -54,8 +54,8 @@ func NewWALWriter(nodeID uint32) (*WALWriter, error) {
 	w := &WALWriter{
 		nodeID:    nodeID,
 		walFile:   walFile,
-		buffer:    make([]string, 0, 1000),
-		maxBuffer: 1000, // Flush after 1000 entries
+		buffer:    make([]string, 0, 5000), // Increased from 1000 to 5000
+		maxBuffer: 5000,                    // Increased from 1000 to 5000
 		syncChan:  make(chan bool),
 		stopChan:  make(chan bool),
 	}
@@ -106,14 +106,17 @@ func (w *WALWriter) flush() error {
 
 func (w *WALWriter) backgroundSync() {
 	defer close(w.doneChan)
-	ticker := time.NewTicker(100 * time.Millisecond)
+	ticker := time.NewTicker(200 * time.Millisecond) // Increased from 100ms to 200ms
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
 			w.mu.Lock()
-			w.flush()
+			// Only flush if there's something to flush
+			if w.bufferSize > 0 {
+				w.flush()
+			}
 			w.mu.Unlock()
 		case <-w.syncChan:
 			w.walFile.Sync()
@@ -275,6 +278,11 @@ func NewStorage(id uint32, replicationFactor ...int) *Storage {
 	// Initialize background tasks
 	n.CheckWALSize()
 	n.StartTTLCleanup() // Start TTL cleanup process
+
+	// First recover from the latest snapshot, then apply any WAL entries after the snapshot
+	if err := n.recoverFromSnapshot(); err != nil {
+		log.Printf("Error recovering from snapshot: %v", err)
+	}
 	n.recoverFromWAL()
 
 	return n
@@ -312,27 +320,22 @@ func (n *Storage) Store(key, value string, timestamp uint64, ttl ...uint64) erro
 		defaultTTL = ttl[0]
 	}
 
-	// Check if this is an update to an existing key
-	n.storeMu.RLock()
-	existingKV, exists := n.store[key]
-	n.storeMu.RUnlock()
-
 	// If this is an update, write a DELETE entry for the old value first
-	if exists && !existingKV.IsTombstone {
-		deleteEntry := &WALEntry{
-			Operation: "DELETE",
-			Key:       key,
-			Timestamp: timestamp - 1, // Use slightly earlier timestamp for the delete
-			CreatedAt: timeNow().Unix(),
-			TTL:       0,
-		}
+	// if exists && !existingKV.IsTombstone {
+	// 	deleteEntry := &WALEntry{
+	// 		Operation: "DELETE",
+	// 		Key:       key,
+	// 		Timestamp: timestamp - 1, // Use slightly earlier timestamp for the delete
+	// 		CreatedAt: timeNow().Unix(),
+	// 		TTL:       0,
+	// 	}
 
-		// Write the delete entry to WAL
-		if err := n.walWriter.Write(deleteEntry); err != nil {
-			log.Printf("WAL delete write failed: %v", err)
-			return err
-		}
-	}
+	// 	// Write the delete entry to WAL
+	// 	if err := n.walWriter.Write(deleteEntry); err != nil {
+	// 		log.Printf("WAL delete write failed: %v", err)
+	// 		return err
+	// 	}
+	// }
 
 	// Now write the new PUT entry
 	entry := &WALEntry{
@@ -396,17 +399,28 @@ func (n *Storage) Delete(key string) error {
 }
 
 func (n *Storage) Get(key string) (string, uint64, bool) {
+	// Use a read lock for better concurrency
 	n.storeMu.RLock()
-	defer n.storeMu.RUnlock()
+	kv, exists := n.store[key]
 
-	if kv, exists := n.store[key]; exists {
-		// Don't return tombstoned entries
-		if kv.IsTombstone {
-			return "", 0, false
-		}
-		return kv.Value, kv.Timestamp, true
+	// If the key doesn't exist, we can return early
+	if !exists {
+		n.storeMu.RUnlock()
+		return "", 0, false
 	}
-	return "", 0, false
+
+	// If the key exists but is a tombstone, return as not found
+	if kv.IsTombstone {
+		n.storeMu.RUnlock()
+		return "", 0, false
+	}
+
+	// Copy values while under lock
+	value := kv.Value
+	timestamp := kv.Timestamp
+	n.storeMu.RUnlock()
+
+	return value, timestamp, true
 }
 
 // GetKeys returns all keys in the store
@@ -638,13 +652,9 @@ func (n *Storage) CheckWALSize() {
 }
 
 func (n *Storage) recoverFromWAL() error {
-	// First try to recover from latest snapshot
-	var snapshotTimestamp uint64
-	if err := n.recoverFromSnapshot(); err != nil {
-		log.Printf("No valid snapshot found: %v", err)
-	} else {
-		snapshotTimestamp = uint64(n.LogicalClock)
-	}
+	// We already recovered from snapshot in NewStorage, so just use the current logical clock
+	// as the snapshot timestamp
+	snapshotTimestamp := uint64(n.LogicalClock)
 
 	// Open WAL file
 	walFile := fmt.Sprintf("wal-%d.log", n.ID)
@@ -881,4 +891,3 @@ func (n *Storage) GarbageCollect(key string) error {
 	}
 	return nil
 }
-

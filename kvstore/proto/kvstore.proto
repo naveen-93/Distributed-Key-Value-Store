@@ -1,4 +1,3 @@
-
 syntax = "proto3";
 
 package kvstore;
@@ -31,7 +30,9 @@ service NodeInternal {
   // GetReplicationMetrics returns metrics about replication operations
   rpc GetReplicationMetrics(Empty) returns (ReplicationMetricsResponse);
   
-  
+  // Anti-Entropy related RPCs
+  rpc GetMerkleTree(MerkleTreeRequest) returns (MerkleTreeResponse);
+  rpc GetBucketKeys(BucketKeysRequest) returns (BucketKeysResponse);
 }
 
 // GetRequest is the request for Get RPC
@@ -112,3 +113,20 @@ message ReplicationMetricsResponse {
   int64 queue_size = 6;
 }
 
+// MerkleTreeRequest is the request for GetMerkleTree RPC
+message MerkleTreeRequest {}
+
+// MerkleTreeResponse is the response for GetMerkleTree RPC
+message MerkleTreeResponse {
+  map<string, uint64> buckets = 1;
+}
+
+// BucketKeysRequest is the request for GetBucketKeys RPC
+message BucketKeysRequest {
+  string bucket_id = 1;
+}
+
+// BucketKeysResponse is the response for GetBucketKeys RPC
+message BucketKeysResponse {
+  repeated string keys = 1;
+} 

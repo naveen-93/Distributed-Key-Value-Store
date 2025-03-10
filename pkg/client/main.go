@@ -201,6 +201,27 @@ func (c *Client) ringAwareGet(ctx context.Context, key string) (string, uint64, 
 	ctx, cancel := context.WithTimeout(ctx, c.config.Timeout)
 	defer cancel()
 
+	// Optimize for the common case - try the primary replica first
+	// This avoids creating goroutines and channels when not needed
+	primaryNodeID := replicas[0]
+	c.ringMu.RLock()
+	primaryAddr, ok := c.nodeAddresses[primaryNodeID]
+	c.ringMu.RUnlock()
+
+	if ok {
+		c.mu.RLock()
+		client, ok := c.clients[primaryAddr]
+		c.mu.RUnlock()
+
+		if ok {
+			resp, err := client.Get(ctx, &pb.GetRequest{Key: key})
+			if err == nil && resp.Exists {
+				return resp.Value, resp.Timestamp, true, nil
+			}
+			// If primary fails, fall through to parallel query
+		}
+	}
+
 	// Query replicas in parallel
 	type result struct {
 		value     string
@@ -250,85 +271,52 @@ func (c *Client) ringAwareGet(ctx context.Context, key string) (string, uint64, 
 				value:     resp.Value,
 				timestamp: resp.Timestamp,
 				exists:    resp.Exists,
+				err:       nil,
 				server:    serverAddr,
 			}
 		}(addr)
 	}
 
-	// Process results
-	var mostRecentValue string
-	var mostRecentTimestamp uint64
-	var mostRecentExists bool
-	var mostRecentServer string
+	// Wait for results
+	var bestResult *result
 	var successCount int
-	var lastErr error
+	timeout := time.After(c.config.Timeout)
 
-	// Wait for all responses or timeout
 	for i := 0; i < len(queriedAddresses); i++ {
 		select {
 		case res := <-resultChan:
-			if res.err != nil {
-				lastErr = res.err
-				log.Printf("Error from server %s: %v", res.server, res.err)
-
-				// Try to reconnect in background if it's a connection error
-				s, ok := status.FromError(res.err)
-				if ok && (s.Code() == codes.Unavailable || s.Code() == codes.DeadlineExceeded) {
-					go func(address string) {
-						if err := c.connectToServer(address); err != nil {
-							log.Printf("Failed to reconnect to %s: %v", address, err)
-						}
-					}(res.server)
+			if res.err == nil {
+				successCount++
+				if res.exists {
+					if bestResult == nil || res.timestamp > bestResult.timestamp {
+						bestResult = &res
+					}
 				}
-				continue
 			}
-
-			successCount++
-
-			// If this server has the key and it's newer than what we've seen so far
-			if res.exists && (mostRecentTimestamp == 0 || res.timestamp > mostRecentTimestamp) {
-				mostRecentValue = res.value
-				mostRecentTimestamp = res.timestamp
-				mostRecentExists = true
-				mostRecentServer = res.server
+		case <-timeout:
+			// Timeout waiting for responses
+			if bestResult != nil {
+				// We have at least one successful result, return it
+				return bestResult.value, bestResult.timestamp, bestResult.exists, nil
 			}
-
+			return "", 0, false, fmt.Errorf("timeout waiting for responses")
 		case <-ctx.Done():
-			// Timeout occurred
-			if successCount == 0 {
-				return "", 0, false, fmt.Errorf("all replica servers timed out")
-			}
-			// Break out of the loop if we've got at least one response
-			i = len(queriedAddresses)
+			// Context cancelled
+			return "", 0, false, ctx.Err()
 		}
 	}
 
-	// If we found the key on at least one server
-	if mostRecentExists {
-		// Update current server index for UI display
-		c.mu.RLock()
-		addresses := make([]string, 0, len(c.clients))
-		for addr := range c.clients {
-			addresses = append(addresses, addr)
-		}
-		c.mu.RUnlock()
-
-		for i, addr := range addresses {
-			if addr == mostRecentServer {
-				c.current = i
-				break
-			}
-		}
-		return mostRecentValue, mostRecentTimestamp, true, nil
+	if bestResult != nil {
+		return bestResult.value, bestResult.timestamp, bestResult.exists, nil
 	}
 
-	// If we got responses but no server had the key
 	if successCount > 0 {
+		// We got responses but none had the key
 		return "", 0, false, nil
 	}
 
-	// All servers failed
-	return "", 0, false, fmt.Errorf("all replica servers failed: %v", lastErr)
+	// No successful responses
+	return "", 0, false, fmt.Errorf("failed to get key from any replica")
 }
 
 // Add fallback Get implementation (existing implementation)
