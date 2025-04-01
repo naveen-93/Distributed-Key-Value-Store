@@ -1,27 +1,21 @@
 package client
 
 import (
-	pb "Distributed-Key-Value-Store/kvstore/proto"
-	"Distributed-Key-Value-Store/pkg/consistenthash"
 	"context"
 	"fmt"
 	"log"
-	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"errors"
+	pb "Distributed-Key-Value-Store/kvstore/proto"
+	"Distributed-Key-Value-Store/pkg/consistenthash"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
-)
-
-var (
-	ErrValidation     = errors.New("validation error")
-	ErrQuorumNotMet   = errors.New("failed to achieve quorum")
-	ErrNoNodes        = errors.New("no available nodes")
-	ErrConnectionFail = errors.New("failed to connect to servers")
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -29,380 +23,12 @@ const (
 	maxValueLength = 2048
 )
 
-// Enhanced ring health tracking
-type ringHealth struct {
-	lastSuccessfulUpdate time.Time
-	consecutiveFailures  int
-	lastError            error
-	mu                   sync.RWMutex
-}
-
-// Client struct update
-type Client struct {
-	mu sync.RWMutex
-
-	// Server management
-	servers     []string
-	ring        *consistenthash.Ring
-	ringVersion uint64
-	connections map[string]*grpc.ClientConn
-	clients     map[string]pb.KVStoreClient
-
-	// Configuration
-	dialTimeout    time.Duration
-	requestTimeout time.Duration
-	maxRetries     int
-	readQuorum     int
-	writeQuorum    int
-	numReplicas    int
-
-	// Ring update configuration
-	ringUpdateInterval time.Duration
-	lastRingUpdate     time.Time
-
-	// Request tracking
-	clientID       uint64
-	requestCounter uint64
-
-	nodeStates  map[string]*nodeState
-	nodeStateMu sync.RWMutex
-	maxFailures int
-
-	ringHealth         ringHealth
-	healthyThreshold   time.Duration
-	unhealthyThreshold int
-}
-
-// Value with timestamp for conflict resolution
-type valueWithTimestamp struct {
-	value     string
-	timestamp uint64
-	exists    bool
-	nodeAddr  string
-}
-
-type nodeState struct {
-	lastSuccess time.Time
-	failures    int
-}
-
-type ClientConfig struct {
-	ReadQuorum     int
-	WriteQuorum    int
-	NumReplicas    int
-	DialTimeout    time.Duration
-	RequestTimeout time.Duration
-	MaxRetries     int
-}
-
-// Add new types for two-phase read
-type readResponse struct {
-	value     string
-	timestamp uint64
-	exists    bool
-	nodeAddr  string
-	err       error
-}
-
-func NewClient(servers []string, config *ClientConfig) (*Client, error) {
-	if len(servers) == 0 {
-		return nil, fmt.Errorf("%w: at least one server required", ErrValidation)
-	}
-
-	// Use provided config or defaults
-	if config == nil {
-		config = &ClientConfig{
-			ReadQuorum:     2,
-			WriteQuorum:    2,
-			NumReplicas:    3,
-			DialTimeout:    5 * time.Second,
-			RequestTimeout: 2 * time.Second,
-			MaxRetries:     3,
-		}
-	}
-
-	client := &Client{
-		servers:            servers,
-		connections:        make(map[string]*grpc.ClientConn),
-		clients:            make(map[string]pb.KVStoreClient),
-		dialTimeout:        config.DialTimeout,
-		requestTimeout:     config.RequestTimeout,
-		maxRetries:         config.MaxRetries,
-		readQuorum:         config.ReadQuorum,
-		writeQuorum:        config.WriteQuorum,
-		numReplicas:        config.NumReplicas,
-		ringUpdateInterval: 30 * time.Second,
-		nodeStates:         make(map[string]*nodeState),
-		maxFailures:        3,
-		healthyThreshold:   5 * time.Minute,
-		unhealthyThreshold: 3,
-	}
-
-	if err := client.initConnections(); err != nil {
-		return nil, fmt.Errorf("connection initialization failed: %w", err)
-	}
-
-	if err := client.updateRing(); err != nil {
-		return nil, fmt.Errorf("initial ring update failed: %w", err)
-	}
-
-	// Start ring health monitoring
-	client.startRingHealthMonitoring()
-	return client, nil
-}
-
-// Get retrieves a value with improved validation and error handling
-func (c *Client) Get(key string) (string, bool, error) {
-	if healthy, err := c.CheckRingHealth(); !healthy {
-		log.Printf("Warning: Ring health check failed: %v", err)
-		// Continue with operation but log the warning
-	}
-
-	if err := validateKey(key); err != nil {
-		return "", false, fmt.Errorf("%w: %v", ErrValidation, err)
-	}
-
-	// Phase 1: Collect all responses
-	candidate, responses, err := c.collectReadResponses(key)
-	if err != nil {
-		return "", false, err
-	}
-
-	// Phase 2: Confirm candidate value
-	confirmed, err := c.confirmValue(key, candidate, responses)
-	if err != nil {
-		return "", false, err
-	}
-
-	if !confirmed {
-		return "", false, fmt.Errorf("failed to confirm consistent value across quorum")
-	}
-
-	// Perform read repair only after confirming the true latest value
-	go c.performReadRepair(key, candidate, responses)
-
-	return candidate.value, candidate.exists, nil
-}
-
-// Phase 1: Collect responses from all replicas
-func (c *Client) collectReadResponses(key string) (valueWithTimestamp, []readResponse, error) {
-	nodes := c.getReplicaNodes(key)
-	if len(nodes) == 0 {
-		return valueWithTimestamp{}, nil, ErrNoNodes
-	}
-
-	responses := make(chan readResponse, len(nodes))
-	var wg sync.WaitGroup
-
-	ctx, cancel := context.WithTimeout(context.Background(), c.requestTimeout)
-	defer cancel()
-
-	// Query all replicas concurrently
-	for _, node := range nodes {
-		wg.Add(1)
-		go func(addr string) {
-			defer wg.Done()
-
-			client := c.clients[addr]
-			resp, err := client.Get(ctx, &pb.GetRequest{Key: key})
-
-			if err != nil {
-				responses <- readResponse{err: err, nodeAddr: addr}
-				return
-			}
-
-			responses <- readResponse{
-				value:     resp.Value,
-				timestamp: resp.Timestamp,
-				exists:    resp.Exists,
-				nodeAddr:  addr,
-			}
-		}(node)
-	}
-
-	// Wait for all responses or timeout
-	go func() {
-		wg.Wait()
-		close(responses)
-	}()
-
-	// Collect responses
-	var allResponses []readResponse
-	var validResponses []valueWithTimestamp
-
-	for resp := range responses {
-		if resp.err == nil {
-			validResponses = append(validResponses, valueWithTimestamp{
-				value:     resp.value,
-				timestamp: resp.timestamp,
-				exists:    resp.exists,
-				nodeAddr:  resp.nodeAddr,
-			})
-		}
-		allResponses = append(allResponses, resp)
-	}
-
-	if len(validResponses) < c.readQuorum {
-		return valueWithTimestamp{}, allResponses, ErrQuorumNotMet
-	}
-
-	// Identify candidate (latest value)
-	candidate := c.resolveConflicts(validResponses)
-	return candidate, allResponses, nil
-}
-
-// Phase 2: Confirm candidate value with quorum
-func (c *Client) confirmValue(key string, candidate valueWithTimestamp, responses []readResponse) (bool, error) {
-	matchCount := 0
-
-	// Count nodes that have the candidate value
-	for _, resp := range responses {
-		if resp.err == nil &&
-			resp.timestamp == candidate.timestamp &&
-			resp.value == candidate.value {
-			matchCount++
-		}
-	}
-
-	// Check if we have quorum agreement
-	return matchCount >= c.readQuorum, nil
-}
-
-// Updated read repair to ensure consistent propagation
-func (c *Client) performReadRepair(key string, confirmed valueWithTimestamp, responses []readResponse) {
-	ctx, cancel := context.WithTimeout(context.Background(), c.requestTimeout)
-	defer cancel()
-
-	var wg sync.WaitGroup
-	for _, resp := range responses {
-		// Skip nodes that already have the correct value
-		if resp.timestamp >= confirmed.timestamp {
-			continue
-		}
-
-		wg.Add(1)
-		go func(addr string) {
-			defer wg.Done()
-
-			req := &pb.PutRequest{
-				Key:       key,
-				Value:     confirmed.value,
-				ClientId:  c.clientID,
-				RequestId: c.nextRequestID(),
-				Timestamp: confirmed.timestamp,
-			}
-
-			client := c.clients[addr]
-			_, err := client.Put(ctx, req)
-			if err != nil {
-				log.Printf("Read repair failed for %s on %s: %v", key, addr, err)
-			}
-		}(resp.nodeAddr)
-	}
-
-	wg.Wait()
-}
-
-// Put sets a value with improved validation and error handling
-func (c *Client) Put(key, value string) (string, bool, error) {
-	if healthy, err := c.CheckRingHealth(); !healthy {
-		log.Printf("Warning: Ring health check failed: %v", err)
-		// Continue with operation but log the warning
-	}
-
-	if err := validateKey(key); err != nil {
-		return "", false, fmt.Errorf("%w: %v", ErrValidation, err)
-	}
-	if err := validateValue(value); err != nil {
-		return "", false, fmt.Errorf("%w: %v", ErrValidation, err)
-	}
-
-	nodes := c.getReplicaNodes(key)
-	if len(nodes) == 0 {
-		return "", false, ErrNoNodes
-	}
-
-	req := &pb.PutRequest{
-		Key:       key,
-		Value:     value,
-		ClientId:  c.clientID,
-		RequestId: c.nextRequestID(),
-	}
-
-	type putResult struct {
-		oldValue    string
-		hadOldValue bool
-		err         error
-	}
-
-	results := make(chan putResult, len(nodes))
-	var wg sync.WaitGroup
-
-	ctx, cancel := context.WithTimeout(context.Background(), c.requestTimeout)
-	defer cancel()
-
-	// Send PUT to all replicas concurrently
-	for _, node := range nodes {
-		wg.Add(1)
-		go func(addr string) {
-			defer wg.Done()
-			resp, err := c.sendPutToReplica(ctx, addr, req)
-			if err != nil {
-				results <- putResult{err: err}
-				return
-			}
-			results <- putResult{
-				oldValue:    resp.OldValue,
-				hadOldValue: resp.HadOldValue,
-			}
-		}(node)
-	}
-
-	// Wait for all goroutines to complete
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	// Process results
-	var successes int
-	var oldValues []valueWithTimestamp
-	var errors []error
-
-	for result := range results {
-		if result.err != nil {
-			errors = append(errors, result.err)
-			continue
-		}
-		successes++
-		if result.hadOldValue {
-			oldValues = append(oldValues, valueWithTimestamp{
-				value:  result.oldValue,
-				exists: true,
-			})
-		}
-	}
-
-	if successes < c.writeQuorum {
-		return "", false, fmt.Errorf("%w: got %d successes, need %d. Errors: %v",
-			ErrQuorumNotMet, successes, c.writeQuorum, errors)
-	}
-
-	if len(oldValues) > 0 {
-		latest := c.resolveConflicts(oldValues)
-		return latest.value, true, nil
-	}
-
-	return "", false, nil
-}
-
-// Validation functions
 func validateKey(key string) error {
 	if len(key) > maxKeyLength {
-		return fmt.Errorf("key exceeds maximum length of %d bytes", maxKeyLength)
+		return fmt.Errorf("key exceeds %d bytes", maxKeyLength)
 	}
 	for _, r := range key {
-		if r < 32 || r > 126 || r == '[' || r == ']' {
+		if r < 32 || r > 126 {
 			return fmt.Errorf("invalid character in key: %q", r)
 		}
 	}
@@ -411,303 +37,657 @@ func validateKey(key string) error {
 
 func validateValue(value string) error {
 	if len(value) > maxValueLength {
-		return fmt.Errorf("value exceeds maximum length of %d bytes", maxValueLength)
+		return fmt.Errorf("value exceeds %d bytes", maxValueLength)
 	}
 	for _, r := range value {
 		if r < 32 || r > 126 {
 			return fmt.Errorf("invalid character in value: %q", r)
 		}
 	}
-	if isUUEncoded(value) {
-		return fmt.Errorf("UU encoded values are not allowed")
-	}
 	return nil
 }
 
-// initConnections establishes connections to all servers
-func (c *Client) initConnections() error {
-	for _, server := range c.servers {
-		ctx, cancel := context.WithTimeout(context.Background(), c.dialTimeout)
-		defer cancel()
+type ClientConfig struct {
+	ServerAddresses []string
+	Timeout         time.Duration
+	RetryAttempts   int
+	RetryDelay      time.Duration
+}
 
-		conn, err := grpc.DialContext(ctx, server,
-			grpc.WithTransportCredentials(insecure.NewCredentials()),
-			grpc.WithBlock(),
-		)
-		if err != nil {
-			log.Printf("Warning: failed to connect to %s: %v", server, err)
-			continue
+type Client struct {
+	config         ClientConfig
+	connections    map[string]*grpc.ClientConn
+	clients        map[string]pb.KVStoreClient
+	mu             sync.RWMutex
+	current        int    // Current server index
+	requestCounter uint64 // For round-robin load balancing
+
+	// Cluster awareness fields
+	ring              *consistenthash.Ring
+	nodeAddresses     map[string]string // Maps nodeID to address
+	replicationFactor int
+	ringVersion       uint64
+	ringMu            sync.RWMutex
+	ctx               context.Context    // Add context
+	cancel            context.CancelFunc // Add cancel function
+}
+
+func NewClient(config ClientConfig) (*Client, error) {
+	if len(config.ServerAddresses) == 0 {
+		return nil, fmt.Errorf("no server addresses provided")
+	}
+
+	if config.Timeout == 0 {
+		config.Timeout = 5 * time.Second
+	}
+	if config.RetryAttempts == 0 {
+		config.RetryAttempts = 3
+	}
+	if config.RetryDelay == 0 {
+		config.RetryDelay = 500 * time.Millisecond
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	client := &Client{
+		config:            config,
+		current:           0,
+		connections:       make(map[string]*grpc.ClientConn),
+		clients:           make(map[string]pb.KVStoreClient),
+		requestCounter:    0,
+		ring:              consistenthash.NewRing(10),
+		nodeAddresses:     make(map[string]string),
+		replicationFactor: 3,
+		ctx:               ctx,
+		cancel:            cancel,
+	}
+
+	for _, addr := range config.ServerAddresses {
+		if err := client.connectToServer(addr); err != nil {
+			log.Printf("Failed to connect to %s: %v", addr, err)
 		}
-
-		c.connections[server] = conn
-		c.clients[server] = pb.NewKVStoreClient(conn)
 	}
 
-	if len(c.connections) == 0 {
-		return fmt.Errorf("failed to connect to any server")
+	if len(client.clients) == 0 {
+		return nil, fmt.Errorf("failed to connect to any server")
 	}
-	return nil
+
+	if err := client.updateRingState(); err != nil {
+		log.Printf("Warning: Failed to fetch initial ring state: %v", err)
+	}
+
+	go client.ringStateUpdater()
+	return client, nil
 }
 
-// Close closes all client connections
-func (c *Client) Close() error {
+func (c *Client) connectToServer(addr string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	var errs []error
-	for server, conn := range c.connections {
-		if err := conn.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("failed to close connection to %s: %v", server, err))
-		}
-	}
-
-	if len(errs) > 0 {
-		return fmt.Errorf("errors closing connections: %v", errs)
-	}
-
-	return nil
-}
-
-func (c *Client) nextRequestID() uint64 {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.requestCounter++
-	return c.requestCounter
-}
-
-func (c *Client) retryWithBackoff(op func() error) error {
-	backoff := 100 * time.Millisecond
-	for retry := 0; retry < c.maxRetries; retry++ {
-		err := op()
-		if err == nil {
-			return nil
-		}
-
-		// Exponential backoff
-		time.Sleep(backoff)
-		backoff *= 2
-	}
-	return fmt.Errorf("operation failed after %d retries", c.maxRetries)
-}
-
-// isUUEncoded returns true if the provided string appears to be UU encoded.
-func isUUEncoded(s string) bool {
-	return strings.HasPrefix(strings.ToLower(s), "begin ")
-}
-
-func (c *Client) getReplicaNodes(key string) []string {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	primaryNode := c.ring.GetNode(key)
-	if primaryNode == "" {
+	// Check if we're already connected
+	if _, exists := c.connections[addr]; exists {
 		return nil
 	}
 
-	nodes := make([]string, 0, c.numReplicas)
-	nodes = append(nodes, primaryNode)
+	// Try to connect
+	ctx, cancel := context.WithTimeout(context.Background(), c.config.Timeout)
+	defer cancel()
 
-	current := c.ring.HashKey(key)
-	for i := 1; i < c.numReplicas && len(nodes) < len(c.servers); i++ {
-		next := c.ring.GetNextNode(current)
-		if next != "" && !contains(nodes, next) && c.isNodeHealthy(next) {
-			nodes = append(nodes, next)
-		}
-		current = c.ring.HashKey(next)
-	}
-	return nodes
-}
-
-func (c *Client) isNodeHealthy(node string) bool {
-	c.nodeStateMu.RLock()
-	defer c.nodeStateMu.RUnlock()
-
-	state, exists := c.nodeStates[node]
-	if !exists {
-		return true // New nodes are assumed healthy
-	}
-	return state.failures < c.maxFailures && time.Since(state.lastSuccess) < c.healthyThreshold
-}
-
-func (c *Client) resolveConflicts(values []valueWithTimestamp) valueWithTimestamp {
-	if len(values) == 0 {
-		return valueWithTimestamp{}
+	conn, err := grpc.DialContext(
+		ctx,
+		addr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithBlock(),
+	)
+	if err != nil {
+		return err
 	}
 
-	// Sort by timestamp (descending) and node address for tie-breaking
-	sort.Slice(values, func(i, j int) bool {
-		if values[i].timestamp == values[j].timestamp {
-			return values[i].nodeAddr > values[j].nodeAddr
-		}
-		return values[i].timestamp > values[j].timestamp
-	})
-
-	return values[0]
+	c.connections[addr] = conn
+	c.clients[addr] = pb.NewKVStoreClient(conn)
+	log.Printf("Connected to server at %s", addr)
+	return nil
 }
 
-func contains(slice []string, str string) bool {
-	for _, s := range slice {
-		if s == str {
-			return true
-		}
-	}
-	return false
-}
-
-func (c *Client) sendPutToReplica(ctx context.Context, node string, req *pb.PutRequest) (*pb.PutResponse, error) {
-	var lastErr error
-
-	for retry := 0; retry < c.maxRetries; retry++ {
-		if retry > 0 {
-			// Exponential backoff
-			backoff := time.Duration(1<<uint(retry-1)) * 50 * time.Millisecond
-			time.Sleep(backoff)
-		}
-
-		client, ok := c.clients[node]
-		if !ok {
-			return nil, fmt.Errorf("no connection to node %s", node)
-		}
-
-		resp, err := client.Put(ctx, req)
-		if err == nil {
-			return resp, nil
-		}
-
-		lastErr = err
-		log.Printf("Retry %d failed for node %s: %v", retry+1, node, err)
-	}
-
-	return nil, fmt.Errorf("failed after %d retries: %v", c.maxRetries, lastErr)
-}
-
-func (c *Client) recordNodeSuccess(addr string) {
-	c.nodeStateMu.Lock()
-	defer c.nodeStateMu.Unlock()
-
-	if state, exists := c.nodeStates[addr]; exists {
-		state.lastSuccess = time.Now()
-		state.failures = 0
-	}
-}
-
-func (c *Client) recordNodeFailure(addr string) bool {
-	c.nodeStateMu.Lock()
-	defer c.nodeStateMu.Unlock()
-
-	state := c.nodeStates[addr]
-	if state == nil {
-		state = &nodeState{}
-		c.nodeStates[addr] = state
-	}
-
-	state.failures++
-	return state.failures >= c.maxFailures
-}
-
-func (c *Client) updateRing() error {
+func (c *Client) Close() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	var updateErrors []error
-	updatedFromAny := false
+	c.cancel() // Stop the background goroutine
 
-	for _, server := range c.servers {
-		if client, ok := c.clients[server]; ok {
-			ctx, cancel := context.WithTimeout(context.Background(), c.dialTimeout)
-			resp, err := client.GetRingState(ctx, &pb.RingStateRequest{})
-			cancel()
+	for addr, conn := range c.connections {
+		if err := conn.Close(); err != nil {
+			log.Printf("Error closing connection to %s: %v", addr, err)
+		}
+	}
 
+	c.connections = make(map[string]*grpc.ClientConn)
+	c.clients = make(map[string]pb.KVStoreClient)
+}
+
+// Get retrieves a value with load balancing and automatic failover
+func (c *Client) Get(ctx context.Context, key string) (string, uint64, bool, error) {
+	if err := validateKey(key); err != nil {
+		return "", 0, false, err
+	}
+
+	// Try to use ring-aware routing first
+	value, timestamp, exists, err := c.ringAwareGet(ctx, key)
+	if err == nil {
+		return value, timestamp, exists, nil
+	}
+
+	// Fall back to querying all servers if ring-aware routing fails
+	log.Printf("Ring-aware routing failed: %v, falling back to querying all servers", err)
+	return c.fallbackGet(ctx, key)
+}
+
+// Add ring-aware Get implementation
+func (c *Client) ringAwareGet(ctx context.Context, key string) (string, uint64, bool, error) {
+	c.ringMu.RLock()
+	if c.ring == nil || len(c.nodeAddresses) == 0 {
+		c.ringMu.RUnlock()
+		return "", 0, false, fmt.Errorf("ring state not available")
+	}
+
+	// Get replicas for this key
+	replicas := c.ring.GetReplicas(key, c.replicationFactor)
+	c.ringMu.RUnlock()
+
+	if len(replicas) == 0 {
+		return "", 0, false, fmt.Errorf("no replicas found for key")
+	}
+
+	// Create context with timeout
+	ctx, cancel := context.WithTimeout(ctx, c.config.Timeout)
+	defer cancel()
+
+	// Optimize for the common case - try the primary replica first
+	// This avoids creating goroutines and channels when not needed
+	primaryNodeID := replicas[0]
+	c.ringMu.RLock()
+	primaryAddr, ok := c.nodeAddresses[primaryNodeID]
+	c.ringMu.RUnlock()
+
+	if ok {
+		c.mu.RLock()
+		client, ok := c.clients[primaryAddr]
+		c.mu.RUnlock()
+
+		if ok {
+			resp, err := client.Get(ctx, &pb.GetRequest{Key: key})
+			if err == nil && resp.Exists {
+				return resp.Value, resp.Timestamp, true, nil
+			}
+			// If primary fails, fall through to parallel query
+		}
+	}
+
+	// Query replicas in parallel
+	type result struct {
+		value     string
+		timestamp uint64
+		exists    bool
+		err       error
+		server    string
+	}
+
+	resultChan := make(chan result, len(replicas))
+	queriedAddresses := make(map[string]bool)
+
+	// Launch parallel requests to replica nodes
+	for _, nodeID := range replicas {
+		c.ringMu.RLock()
+		addr, ok := c.nodeAddresses[nodeID]
+		c.ringMu.RUnlock()
+
+		if !ok {
+			log.Printf("No address found for node %s", nodeID)
+			continue
+		}
+
+		// Skip if we've already queried this address
+		if queriedAddresses[addr] {
+			continue
+		}
+		queriedAddresses[addr] = true
+
+		go func(serverAddr string) {
+			c.mu.RLock()
+			client, ok := c.clients[serverAddr]
+			c.mu.RUnlock()
+
+			if !ok {
+				resultChan <- result{err: fmt.Errorf("no client for server %s", serverAddr), server: serverAddr}
+				return
+			}
+
+			resp, err := client.Get(ctx, &pb.GetRequest{Key: key})
 			if err != nil {
-				updateErrors = append(updateErrors, fmt.Errorf("failed to update from %s: %v", server, err))
-				c.recordRingUpdateFailure(err)
+				resultChan <- result{err: err, server: serverAddr}
+				return
+			}
+
+			resultChan <- result{
+				value:     resp.Value,
+				timestamp: resp.Timestamp,
+				exists:    resp.Exists,
+				err:       nil,
+				server:    serverAddr,
+			}
+		}(addr)
+	}
+
+	// Wait for results
+	var bestResult *result
+	var successCount int
+	timeout := time.After(c.config.Timeout)
+
+	for i := 0; i < len(queriedAddresses); i++ {
+		select {
+		case res := <-resultChan:
+			if res.err == nil {
+				successCount++
+				if res.exists {
+					if bestResult == nil || res.timestamp > bestResult.timestamp {
+						bestResult = &res
+					}
+				}
+			}
+		case <-timeout:
+			// Timeout waiting for responses
+			if bestResult != nil {
+				// We have at least one successful result, return it
+				return bestResult.value, bestResult.timestamp, bestResult.exists, nil
+			}
+			return "", 0, false, fmt.Errorf("timeout waiting for responses")
+		case <-ctx.Done():
+			// Context cancelled
+			return "", 0, false, ctx.Err()
+		}
+	}
+
+	if bestResult != nil {
+		return bestResult.value, bestResult.timestamp, bestResult.exists, nil
+	}
+
+	if successCount > 0 {
+		// We got responses but none had the key
+		return "", 0, false, nil
+	}
+
+	// No successful responses
+	return "", 0, false, fmt.Errorf("failed to get key from any replica")
+}
+
+// Add fallback Get implementation (existing implementation)
+func (c *Client) fallbackGet(ctx context.Context, key string) (string, uint64, bool, error) {
+	c.mu.RLock()
+	addresses := make([]string, 0, len(c.clients))
+	for addr := range c.clients {
+		addresses = append(addresses, addr)
+	}
+	c.mu.RUnlock()
+
+	if len(addresses) == 0 {
+		return "", 0, false, fmt.Errorf("no available servers")
+	}
+
+	// Query all servers in parallel
+	ctx, cancel := context.WithTimeout(ctx, c.config.Timeout)
+	defer cancel()
+
+	type result struct {
+		value     string
+		timestamp uint64
+		exists    bool
+		err       error
+		server    string
+	}
+
+	resultChan := make(chan result, len(addresses))
+
+	// Launch parallel requests to all servers
+	for _, addr := range addresses {
+		go func(serverAddr string) {
+			c.mu.RLock()
+			client, ok := c.clients[serverAddr]
+			c.mu.RUnlock()
+
+			if !ok {
+				resultChan <- result{err: fmt.Errorf("no client for server %s", serverAddr), server: serverAddr}
+				return
+			}
+
+			resp, err := client.Get(ctx, &pb.GetRequest{Key: key})
+			if err != nil {
+				resultChan <- result{err: err, server: serverAddr}
+				return
+			}
+
+			resultChan <- result{
+				value:     resp.Value,
+				timestamp: resp.Timestamp,
+				exists:    resp.Exists,
+				server:    serverAddr,
+			}
+		}(addr)
+	}
+
+	// Process results
+	var mostRecentValue string
+	var mostRecentTimestamp uint64
+	var mostRecentExists bool
+	var mostRecentServer string
+	var successCount int
+	var lastErr error
+
+	// Wait for all responses or timeout
+	for i := 0; i < len(addresses); i++ {
+		select {
+		case res := <-resultChan:
+			if res.err != nil {
+				lastErr = res.err
+				log.Printf("Error from server %s: %v", res.server, res.err)
+
+				// Try to reconnect in background if it's a connection error
+				s, ok := status.FromError(res.err)
+				if ok && (s.Code() == codes.Unavailable || s.Code() == codes.DeadlineExceeded) {
+					go func(address string) {
+						if err := c.connectToServer(address); err != nil {
+							log.Printf("Failed to reconnect to %s: %v", address, err)
+						}
+					}(res.server)
+				}
 				continue
 			}
 
-			// Only update if version is newer
-			if resp.Version > c.ringVersion {
-				if err := c.applyRingUpdate(resp); err != nil {
-					updateErrors = append(updateErrors, err)
-					c.recordRingUpdateFailure(err)
-					continue
-				}
-				updatedFromAny = true
-				c.recordRingUpdateSuccess()
+			successCount++
+
+			// If this server has the key and it's newer than what we've seen so far
+			if res.exists && (mostRecentTimestamp == 0 || res.timestamp > mostRecentTimestamp) {
+				mostRecentValue = res.value
+				mostRecentTimestamp = res.timestamp
+				mostRecentExists = true
+				mostRecentServer = res.server
+			}
+
+		case <-ctx.Done():
+			// Timeout occurred
+			if successCount == 0 {
+				return "", 0, false, fmt.Errorf("all servers timed out")
+			}
+			// Break out of the loop if we've got at least one response
+			i = len(addresses)
+		}
+	}
+
+	// If we found the key on at least one server
+	if mostRecentExists {
+		// Update current server index for UI display
+		for i, addr := range addresses {
+			if addr == mostRecentServer {
+				c.current = i
 				break
 			}
 		}
+		return mostRecentValue, mostRecentTimestamp, true, nil
 	}
 
-	if !updatedFromAny && c.ring == nil {
-		return fmt.Errorf("failed to initialize ring: %v", updateErrors)
+	// If we got responses but no server had the key
+	if successCount > 0 {
+		return "", 0, false, nil
 	}
 
-	return nil
+	// All servers failed
+	return "", 0, false, fmt.Errorf("all servers failed: %v", lastErr)
 }
 
-func (c *Client) recordRingUpdateSuccess() {
-	c.ringHealth.mu.Lock()
-	defer c.ringHealth.mu.Unlock()
+// Put stores a value with load balancing and automatic failover
+func (c *Client) Put(ctx context.Context, key, value string) (string, bool, error) {
+	if err := validateKey(key); err != nil {
+		return "", false, err
+	}
+	if err := validateValue(value); err != nil {
+		return "", false, err
+	}
 
-	c.ringHealth.lastSuccessfulUpdate = time.Now()
-	c.ringHealth.consecutiveFailures = 0
-	c.ringHealth.lastError = nil
+	// Try to use ring-aware routing first
+	oldValue, hadOldValue, err := c.ringAwarePut(ctx, key, value)
+	if err == nil {
+		return oldValue, hadOldValue, nil
+	}
+
+	// Fall back to round-robin if ring-aware routing fails
+	log.Printf("Ring-aware routing failed: %v, falling back to round-robin", err)
+	return c.fallbackPut(ctx, key, value)
 }
 
-func (c *Client) recordRingUpdateFailure(err error) {
-	c.ringHealth.mu.Lock()
-	defer c.ringHealth.mu.Unlock()
+// Add ring-aware Put implementation
+func (c *Client) ringAwarePut(ctx context.Context, key, value string) (string, bool, error) {
+	c.ringMu.RLock()
+	if c.ring == nil || len(c.nodeAddresses) == 0 {
+		c.ringMu.RUnlock()
+		return "", false, fmt.Errorf("ring state not available")
+	}
 
-	c.ringHealth.consecutiveFailures++
-	c.ringHealth.lastError = err
-}
+	// Get primary node for this key
+	replicas := c.ring.GetReplicas(key, c.replicationFactor)
+	c.ringMu.RUnlock()
 
-func (c *Client) startRingHealthMonitoring() {
-	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
+	if len(replicas) == 0 {
+		return "", false, fmt.Errorf("no replicas found for key")
+	}
 
-		for range ticker.C {
-			healthy, err := c.CheckRingHealth()
-			if !healthy {
-				log.Printf("Ring health check failed: %v", err)
-				// Trigger immediate ring update attempt
-				if err := c.updateRing(); err != nil {
-					log.Printf("Failed to update ring after health check failure: %v", err)
+	// Try each replica in order until success
+	var lastErr error
+	for _, nodeID := range replicas {
+		c.ringMu.RLock()
+		addr, ok := c.nodeAddresses[nodeID]
+		c.ringMu.RUnlock()
+
+		if !ok {
+			log.Printf("No address found for node %s", nodeID)
+			continue
+		}
+
+		c.mu.RLock()
+		client, ok := c.clients[addr]
+		c.mu.RUnlock()
+
+		if !ok {
+			log.Printf("No client for server %s", addr)
+			continue
+		}
+
+		ctx, cancel := context.WithTimeout(ctx, c.config.Timeout)
+		resp, err := client.Put(ctx, &pb.PutRequest{Key: key, Value: value})
+		cancel()
+
+		if err == nil {
+			// Success - update current server index for UI display
+			c.mu.RLock()
+			addresses := make([]string, 0, len(c.clients))
+			for a := range c.clients {
+				addresses = append(addresses, a)
+			}
+			c.mu.RUnlock()
+
+			for i, a := range addresses {
+				if a == addr {
+					c.current = i
+					break
 				}
 			}
+			return resp.OldValue, resp.HadOldValue, nil
 		}
-	}()
+
+		lastErr = err
+		log.Printf("Error from server %s: %v", addr, err)
+
+		// If this is a connection error, try to reconnect
+		s, ok := status.FromError(err)
+		if ok && (s.Code() == codes.Unavailable || s.Code() == codes.DeadlineExceeded) {
+			go func(address string) {
+				if err := c.connectToServer(address); err != nil {
+					log.Printf("Failed to reconnect to %s: %v", address, err)
+				}
+			}(addr)
+		}
+	}
+
+	return "", false, fmt.Errorf("all replicas failed: %v", lastErr)
 }
 
-// Helper method to apply ring updates
-func (c *Client) applyRingUpdate(resp *pb.RingStateResponse) error {
-	newRing := consistenthash.NewRing(consistenthash.DefaultVirtualNodes)
-	for node, isActive := range resp.Nodes {
-		if isActive {
-			newRing.AddNode(node)
+// Add fallback Put implementation (existing implementation)
+func (c *Client) fallbackPut(ctx context.Context, key, value string) (string, bool, error) {
+	c.mu.RLock()
+	addresses := make([]string, 0, len(c.clients))
+	for addr := range c.clients {
+		addresses = append(addresses, addr)
+	}
+	c.mu.RUnlock()
+
+	if len(addresses) == 0 {
+		return "", false, fmt.Errorf("no available servers")
+	}
+
+	// Choose initial server using round-robin
+	startIndex := int(atomic.AddUint64(&c.requestCounter, 1) % uint64(len(addresses)))
+
+	// Try each server until success or all fail
+	var lastErr error
+	for attempt := 0; attempt < c.config.RetryAttempts; attempt++ {
+		// Start with the selected server, then try others
+		for i := 0; i < len(addresses); i++ {
+			serverIndex := (startIndex + i) % len(addresses)
+			addr := addresses[serverIndex]
+
+			c.mu.RLock()
+			client, ok := c.clients[addr]
+			c.mu.RUnlock()
+
+			if !ok {
+				continue
+			}
+
+			reqCtx, cancel := context.WithTimeout(ctx, c.config.Timeout)
+			resp, err := client.Put(reqCtx, &pb.PutRequest{Key: key, Value: value})
+			cancel()
+
+			if err == nil {
+				// Success - update current server index for UI display
+				c.current = serverIndex
+				return resp.OldValue, resp.HadOldValue, nil
+			}
+
+			lastErr = err
+			log.Printf("Error from server %s: %v", addr, err)
+
+			// If this is a connection error, try to reconnect
+			s, ok := status.FromError(err)
+			if ok && (s.Code() == codes.Unavailable || s.Code() == codes.DeadlineExceeded) {
+				// Try to reconnect in background
+				go func(address string) {
+					if err := c.connectToServer(address); err != nil {
+						log.Printf("Failed to reconnect to %s: %v", address, err)
+					}
+				}(addr)
+			}
+		}
+
+		// All servers failed this attempt, wait before retry
+		if attempt < c.config.RetryAttempts-1 {
+			time.Sleep(c.config.RetryDelay)
 		}
 	}
-	c.ring = newRing
-	c.ringVersion = resp.Version
-	c.lastRingUpdate = time.Unix(resp.UpdatedAt, 0)
-	return nil
+
+	return "", false, fmt.Errorf("all servers failed: %v", lastErr)
 }
 
-// Enhanced ring health check
-func (c *Client) CheckRingHealth() (bool, error) {
-	c.ringHealth.mu.RLock()
-	defer c.ringHealth.mu.RUnlock()
+// Add method to update ring state
+func (c *Client) updateRingState() error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 
-	if time.Since(c.ringHealth.lastSuccessfulUpdate) > c.healthyThreshold {
-		return false, fmt.Errorf("ring update too old: last success was %v ago",
-			time.Since(c.ringHealth.lastSuccessfulUpdate))
+	// Try to get ring state from any available server
+	var lastErr error
+	for addr, client := range c.clients {
+		ctx, cancel := context.WithTimeout(c.ctx, c.config.Timeout)
+		resp, err := client.GetRingState(ctx, &pb.RingStateRequest{})
+		cancel()
+
+		if err != nil {
+			lastErr = err
+			log.Printf("Failed to get ring state from %s: %v", addr, err)
+			continue
+		}
+
+		// Successfully got ring state
+		c.ringMu.Lock()
+
+		// Only update if this is a newer version
+		if resp.Version > c.ringVersion {
+			// Reset the ring
+			c.ring = consistenthash.NewRing(10)
+
+			// Add all nodes to the ring
+			for nodeID := range resp.Nodes {
+				c.ring.AddNode(nodeID)
+
+				// If we don't have this node's address yet, use a default one
+				// This will be updated when we connect to the node
+				if _, exists := c.nodeAddresses[nodeID]; !exists {
+					// Try to extract address from our connections
+					found := false
+					for serverAddr := range c.clients {
+						// This is a simplistic approach - in a real system you'd have
+						// a more robust way to map node IDs to addresses
+						if strings.Contains(serverAddr, strings.TrimPrefix(nodeID, "node-")) {
+							c.nodeAddresses[nodeID] = serverAddr
+							found = true
+							break
+						}
+					}
+
+					if !found {
+						// Use any server as fallback
+						for serverAddr := range c.clients {
+							c.nodeAddresses[nodeID] = serverAddr
+							break
+						}
+					}
+				}
+			}
+
+			c.ringVersion = resp.Version
+
+			log.Printf("Updated ring state: version=%d, nodes=%d",
+				c.ringVersion, len(resp.Nodes))
+		}
+
+		c.ringMu.Unlock()
+		return nil
 	}
 
-	if c.ringHealth.consecutiveFailures >= c.unhealthyThreshold {
-		return false, fmt.Errorf("ring unstable: %d consecutive failures, last error: %v",
-			c.ringHealth.consecutiveFailures, c.ringHealth.lastError)
+	if lastErr != nil {
+		return fmt.Errorf("failed to get ring state from any server: %v", lastErr)
 	}
+	return fmt.Errorf("no servers available to get ring state")
+}
 
-	return true, nil
+// Add background updater for ring state
+func (c *Client) ringStateUpdater() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if err := c.updateRingState(); err != nil {
+				log.Printf("Failed to update ring state: %v", err)
+			}
+		case <-c.ctx.Done():
+			return
+		}
+	}
 }

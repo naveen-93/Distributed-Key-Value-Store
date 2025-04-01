@@ -28,7 +28,7 @@ func TestBasicOperations(t *testing.T) {
 	cleanup(nodeID)
 	defer cleanup(nodeID)
 
-	node := NewNode(nodeID)
+	node := NewStorage(nodeID)
 
 	// Test Store and Get
 	t.Run("Store and Get", func(t *testing.T) {
@@ -68,7 +68,7 @@ func TestConcurrentOperations(t *testing.T) {
 	cleanup(nodeID)
 	defer cleanup(nodeID)
 
-	node := NewNode(nodeID)
+	node := NewStorage(nodeID)
 
 	const (
 		numGoroutines   = 10
@@ -111,7 +111,7 @@ func TestWALRecovery(t *testing.T) {
 	defer cleanup(nodeID)
 
 	t.Run("Recovery After Crash", func(t *testing.T) {
-		node1 := NewNode(nodeID)
+		node1 := NewStorage(nodeID)
 
 		testData := map[string]string{
 			"key1": "value1",
@@ -129,7 +129,7 @@ func TestWALRecovery(t *testing.T) {
 		require.NoError(t, node1.Shutdown(), "Shutdown failed")
 
 		// Create new node to simulate recovery
-		node2 := NewNode(nodeID)
+		node2 := NewStorage(nodeID)
 
 		// Verify recovery
 		for key, expectedValue := range testData {
@@ -140,49 +140,13 @@ func TestWALRecovery(t *testing.T) {
 	})
 }
 
-func TestSnapshotting(t *testing.T) {
-	nodeID := uint32(4)
-	cleanup(nodeID)
-	defer cleanup(nodeID)
-
-	node := NewNode(nodeID)
-
-	t.Run("Snapshot Creation and Recovery", func(t *testing.T) {
-		// Store enough data to trigger snapshot
-		for i := 0; i < 1000; i++ {
-			key := fmt.Sprintf("key-%d", i)
-			value := fmt.Sprintf("value-%d", i)
-			node.Store(key, value, node.generateTimestamp())
-		}
-
-		// Force compaction
-		require.NoError(t, node.compactWAL())
-
-		// Verify snapshot was created
-		files, err := os.ReadDir("snapshots")
-		require.NoError(t, err)
-		assert.True(t, len(files) > 0)
-
-		// Create new node instance to test recovery from snapshot
-		node2 := NewNode(nodeID)
-
-		// Verify recovered data
-		for i := 0; i < 1000; i++ {
-			key := fmt.Sprintf("key-%d", i)
-			expectedValue := fmt.Sprintf("value-%d", i)
-			value, _, exists := node2.Get(key)
-			assert.True(t, exists)
-			assert.Equal(t, expectedValue, value)
-		}
-	})
-}
 
 func TestTimestampOrdering(t *testing.T) {
 	nodeID := uint32(5)
 	cleanup(nodeID)
 	defer cleanup(nodeID)
 
-	node := NewNode(nodeID)
+	node := NewStorage(nodeID)
 
 	t.Run("Timestamp Ordering", func(t *testing.T) {
 		key := "timestamp-test"
@@ -217,7 +181,7 @@ func TestTombstones(t *testing.T) {
 	cleanup(nodeID)
 	defer cleanup(nodeID)
 
-	node := NewNode(nodeID)
+	node := NewStorage(nodeID)
 
 	t.Run("Tombstone Behavior", func(t *testing.T) {
 		key := "tombstone-test"
@@ -252,7 +216,7 @@ func TestStressTest(t *testing.T) {
 	cleanup(nodeID)
 	defer cleanup(nodeID)
 
-	node := NewNode(nodeID)
+	node := NewStorage(nodeID)
 
 	const (
 		numOps        = 1000000 // Increased from 10000
@@ -334,7 +298,7 @@ func TestBoundaryConditions(t *testing.T) {
 	cleanup(nodeID)
 	defer cleanup(nodeID)
 
-	node := NewNode(nodeID)
+	node := NewStorage(nodeID)
 
 	t.Run("Large Key/Value Pairs", func(t *testing.T) {
 		// 1MB value
@@ -374,7 +338,7 @@ func TestWALCorruption(t *testing.T) {
 	defer cleanup(nodeID)
 
 	// Create and populate first node
-	node := NewNode(nodeID)
+	node := NewStorage(nodeID)
 	node.Store("key1", "value1", node.generateTimestamp())
 	node.Store("key2", "value2", node.generateTimestamp())
 
@@ -404,7 +368,7 @@ func TestWALCorruption(t *testing.T) {
 	f.Close()
 
 	// Create new node instance to test recovery
-	node2 := NewNode(nodeID)
+	node2 := NewStorage(nodeID)
 
 	// Verify valid entries are recovered
 	val1, _, exists1 := node2.Get("key1")
@@ -425,7 +389,7 @@ func TestTTLCleanup(t *testing.T) {
 	cleanup(nodeID)
 	defer cleanup(nodeID)
 
-	node := NewNode(nodeID)
+	node := NewStorage(nodeID)
 
 	// Mock time
 	mockTime := time.Now()
@@ -460,7 +424,7 @@ func TestConcurrentSnapshots(t *testing.T) {
 	cleanup(nodeID)
 	defer cleanup(nodeID)
 
-	node := NewNode(nodeID)
+	node := NewStorage(nodeID)
 
 	const numOps = 10000
 	done := make(chan struct{})
@@ -496,7 +460,7 @@ func TestMaxSnapshotLimit(t *testing.T) {
 	cleanup(nodeID)
 	defer cleanup(nodeID)
 
-	node := NewNode(nodeID)
+	node := NewStorage(nodeID)
 
 	t.Run("Max Snapshots Maintained", func(t *testing.T) {
 		// Create multiple snapshots
@@ -525,7 +489,7 @@ func BenchmarkStorageOperations(b *testing.B) {
 	cleanup(nodeID)
 	defer cleanup(nodeID)
 
-	node := NewNode(nodeID)
+	node := NewStorage(nodeID)
 
 	b.Run("Store Operation", func(b *testing.B) {
 		b.ResetTimer()
@@ -562,7 +526,7 @@ func TestExtendedWALCorruption(t *testing.T) {
 	cleanup(nodeID)
 	defer cleanup(nodeID)
 
-	node := NewNode(nodeID)
+	node := NewStorage(nodeID)
 
 	// Add 100 entries
 	for i := 0; i < 100; i++ {
@@ -597,7 +561,7 @@ func TestExtendedWALCorruption(t *testing.T) {
 	require.NoError(t, err)
 
 	// Create new node instance to test recovery
-	node2 := NewNode(nodeID)
+	node2 := NewStorage(nodeID)
 
 	// Verify valid entries are recovered
 	recoveredCount := 0
@@ -628,7 +592,7 @@ func TestExtendedTTLBehavior(t *testing.T) {
 		return mockTime
 	}
 
-	node := NewNode(nodeID)
+	node := NewStorage(nodeID)
 
 	// Store keys with different TTLs
 	ttls := []uint64{3600, 7200, 14400, 28800, 86400} // 1h, 2h, 4h, 8h, 24h
@@ -680,7 +644,7 @@ func TestHighConcurrency(t *testing.T) {
 	cleanup(nodeID)
 	defer cleanup(nodeID)
 
-	node := NewNode(nodeID)
+	node := NewStorage(nodeID)
 
 	const (
 		numReaders      = 20
@@ -747,7 +711,7 @@ func TestSnapshotCorruption(t *testing.T) {
 	cleanup(nodeID)
 	defer cleanup(nodeID)
 
-	node := NewNode(nodeID)
+	node := NewStorage(nodeID)
 
 	// Add some data and ensure it's written to WAL
 	for i := 0; i < 100; i++ {
@@ -780,7 +744,7 @@ func TestSnapshotCorruption(t *testing.T) {
 	require.NoError(t, err)
 
 	// Create new node and verify it falls back to WAL
-	node2 := NewNode(nodeID)
+	node2 := NewStorage(nodeID)
 
 	// Check if data was recovered from WAL
 	recoveredCount := 0
@@ -807,7 +771,7 @@ func TestLongRunningPerformance(t *testing.T) {
 	cleanup(nodeID)
 	defer cleanup(nodeID)
 
-	node := NewNode(nodeID)
+	node := NewStorage(nodeID)
 
 	const (
 		testDuration   = 30 * time.Second

@@ -154,11 +154,16 @@ func (r *Ring) GetNextNode(hash uint32) string {
 	return r.mapping[r.hashRing[idx]]
 }
 
-// HashKey generates a hash for a string using MurmurHash3
-func (r *Ring) HashKey(s string) uint32 {
-	r.hashFunc.Reset()
-	r.hashFunc.Write([]byte(s))
-	return r.hashFunc.Sum32()
+// HashKey hashes a key to a position on the ring
+func (r *Ring) HashKey(key string) uint32 {
+	// Handle empty keys to prevent nil pointer dereference
+	if key == "" {
+		return 0
+	}
+
+	h := murmur3.New32()
+	h.Write([]byte(key))
+	return h.Sum32()
 }
 
 // DisplayRing prints the hash ring for debugging
@@ -172,43 +177,72 @@ func (r *Ring) DisplayRing() {
 	}
 }
 
-// GetReplicas returns up to N unique responsible nodes for a key
-func (r *Ring) GetReplicas(key string, count int) []string {
+// GetReplicas returns the n replicas for a given key
+func (r *Ring) GetReplicas(key string, n int) []string {
 	r.RLock()
 	defer r.RUnlock()
 
-	if len(r.hashRing) == 0 || count < 1 {
+	if len(r.hashRing) == 0 {
 		return nil
 	}
 
-	uniqueNodes := len(r.vnodes)
-	if count > uniqueNodes {
-		count = uniqueNodes
+	// Get unique nodes if available
+	uniqueNodeCount := len(r.vnodes)
+	if uniqueNodeCount == 0 {
+		// Count unique nodes manually if vnodes map isn't maintained
+		uniqueSet := make(map[string]bool)
+		for _, nodeID := range r.mapping {
+			uniqueSet[nodeID] = true
+		}
+		uniqueNodeCount = len(uniqueSet)
 	}
+
+	// Can't have more replicas than unique nodes
+	if n > uniqueNodeCount {
+		n = uniqueNodeCount
+	}
+
+	// If we only need one replica, we can optimize by just returning the primary node
+	if n == 1 {
+		hash := r.HashKey(key)
+		idx := r.search(hash)
+		if idx >= len(r.hashRing) {
+			idx = 0
+		}
+		return []string{r.mapping[r.hashRing[idx]]}
+	}
+
+	// For small n, preallocate the exact size
+	replicas := make([]string, 0, n)
+	seenNodes := make(map[string]bool, n)
 
 	hash := r.HashKey(key)
-	idx := sort.Search(len(r.hashRing), func(i int) bool {
-		return r.hashRing[i] >= hash
-	})
 
-	if idx == len(r.hashRing) {
-		idx = 0
+	// Find the starting point in the ring
+	startIdx := r.search(hash)
+	if startIdx >= len(r.hashRing) {
+		startIdx = 0
 	}
 
-	replicas := make([]string, 0, count)
-	seen := make(map[string]struct{})
-
-	for len(replicas) < count {
-		node := r.mapping[r.hashRing[idx]]
-		if _, exists := seen[node]; !exists {
-			replicas = append(replicas, node)
-			seen[node] = struct{}{}
+	// Collect n unique nodes, starting from the position after hash
+	idx := startIdx
+	for len(replicas) < n {
+		if idx >= len(r.hashRing) {
+			idx = 0 // Wrap around
 		}
 
-		idx = (idx + 1) % len(r.hashRing)
+		nodeHash := r.hashRing[idx]
+		nodeID := r.mapping[nodeHash]
 
-		// Break early if all nodes are exhausted
-		if len(seen) == uniqueNodes {
+		if !seenNodes[nodeID] {
+			replicas = append(replicas, nodeID)
+			seenNodes[nodeID] = true
+		}
+
+		idx++
+
+		// Break if we've checked all nodes in the ring
+		if idx == startIdx {
 			break
 		}
 	}
@@ -216,8 +250,43 @@ func (r *Ring) GetReplicas(key string, count int) []string {
 	return replicas
 }
 
+// Add this helper method after the existing GetReplicas method
+func (r *Ring) search(hash uint32) int {
+	return sort.Search(len(r.hashRing), func(i int) bool {
+		return r.hashRing[i] >= hash
+	})
+}
+
 func HashString(s string) uint32 {
 	h := murmur3.New32()
 	h.Write([]byte(s))
 	return h.Sum32()
+}
+
+// GetNodes returns n nodes for a given key
+func (r *Ring) GetNodes(key string, n int) []string {
+	r.RLock()
+	defer r.RUnlock()
+
+	if len(r.hashRing) == 0 {
+		return nil
+	}
+
+	hash := r.HashKey(key)
+	idx := r.search(hash)
+
+	nodes := make([]string, 0, n)
+	seen := make(map[string]bool)
+
+	for i := 0; len(nodes) < n && i < len(r.hashRing); i++ {
+		nodeIdx := (idx + i) % len(r.hashRing)
+		nodeID := r.mapping[r.hashRing[nodeIdx]]
+
+		if !seen[nodeID] {
+			nodes = append(nodes, nodeID)
+			seen[nodeID] = true
+		}
+	}
+
+	return nodes
 }

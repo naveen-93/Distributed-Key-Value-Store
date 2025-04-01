@@ -201,11 +201,13 @@ var KVStore_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	NodeInternal_Replicate_FullMethodName      = "/kvstore.NodeInternal/Replicate"
-	NodeInternal_SyncKeys_FullMethodName       = "/kvstore.NodeInternal/SyncKeys"
-	NodeInternal_Heartbeat_FullMethodName      = "/kvstore.NodeInternal/Heartbeat"
-	NodeInternal_GarbageCollect_FullMethodName = "/kvstore.NodeInternal/GarbageCollect"
-	NodeInternal_GetReplica_FullMethodName     = "/kvstore.NodeInternal/GetReplica"
+	NodeInternal_Replicate_FullMethodName             = "/kvstore.NodeInternal/Replicate"
+	NodeInternal_SyncKeys_FullMethodName              = "/kvstore.NodeInternal/SyncKeys"
+	NodeInternal_Heartbeat_FullMethodName             = "/kvstore.NodeInternal/Heartbeat"
+	NodeInternal_GarbageCollect_FullMethodName        = "/kvstore.NodeInternal/GarbageCollect"
+	NodeInternal_GetReplica_FullMethodName            = "/kvstore.NodeInternal/GetReplica"
+	NodeInternal_AddNode_FullMethodName               = "/kvstore.NodeInternal/AddNode"
+	NodeInternal_GetReplicationMetrics_FullMethodName = "/kvstore.NodeInternal/GetReplicationMetrics"
 )
 
 // NodeInternalClient is the client API for NodeInternal service.
@@ -219,6 +221,8 @@ type NodeInternalClient interface {
 	Heartbeat(ctx context.Context, in *Ping, opts ...grpc.CallOption) (*Pong, error)
 	GarbageCollect(ctx context.Context, in *GarbageCollectRequest, opts ...grpc.CallOption) (*GarbageCollectResponse, error)
 	GetReplica(ctx context.Context, in *GetReplicaRequest, opts ...grpc.CallOption) (*GetReplicaResponse, error)
+	AddNode(ctx context.Context, in *AddNodeRequest, opts ...grpc.CallOption) (*Empty, error)
+	GetReplicationMetrics(ctx context.Context, in *Empty, opts ...grpc.CallOption) (*ReplicationMetricsResponse, error)
 }
 
 type nodeInternalClient struct {
@@ -279,6 +283,26 @@ func (c *nodeInternalClient) GetReplica(ctx context.Context, in *GetReplicaReque
 	return out, nil
 }
 
+func (c *nodeInternalClient) AddNode(ctx context.Context, in *AddNodeRequest, opts ...grpc.CallOption) (*Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Empty)
+	err := c.cc.Invoke(ctx, NodeInternal_AddNode_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *nodeInternalClient) GetReplicationMetrics(ctx context.Context, in *Empty, opts ...grpc.CallOption) (*ReplicationMetricsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReplicationMetricsResponse)
+	err := c.cc.Invoke(ctx, NodeInternal_GetReplicationMetrics_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // NodeInternalServer is the server API for NodeInternal service.
 // All implementations must embed UnimplementedNodeInternalServer
 // for forward compatibility.
@@ -290,6 +314,8 @@ type NodeInternalServer interface {
 	Heartbeat(context.Context, *Ping) (*Pong, error)
 	GarbageCollect(context.Context, *GarbageCollectRequest) (*GarbageCollectResponse, error)
 	GetReplica(context.Context, *GetReplicaRequest) (*GetReplicaResponse, error)
+	AddNode(context.Context, *AddNodeRequest) (*Empty, error)
+	GetReplicationMetrics(context.Context, *Empty) (*ReplicationMetricsResponse, error)
 	mustEmbedUnimplementedNodeInternalServer()
 }
 
@@ -314,6 +340,12 @@ func (UnimplementedNodeInternalServer) GarbageCollect(context.Context, *GarbageC
 }
 func (UnimplementedNodeInternalServer) GetReplica(context.Context, *GetReplicaRequest) (*GetReplicaResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetReplica not implemented")
+}
+func (UnimplementedNodeInternalServer) AddNode(context.Context, *AddNodeRequest) (*Empty, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method AddNode not implemented")
+}
+func (UnimplementedNodeInternalServer) GetReplicationMetrics(context.Context, *Empty) (*ReplicationMetricsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetReplicationMetrics not implemented")
 }
 func (UnimplementedNodeInternalServer) mustEmbedUnimplementedNodeInternalServer() {}
 func (UnimplementedNodeInternalServer) testEmbeddedByValue()                      {}
@@ -426,6 +458,42 @@ func _NodeInternal_GetReplica_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _NodeInternal_AddNode_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AddNodeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NodeInternalServer).AddNode(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NodeInternal_AddNode_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NodeInternalServer).AddNode(ctx, req.(*AddNodeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _NodeInternal_GetReplicationMetrics_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NodeInternalServer).GetReplicationMetrics(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NodeInternal_GetReplicationMetrics_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NodeInternalServer).GetReplicationMetrics(ctx, req.(*Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // NodeInternal_ServiceDesc is the grpc.ServiceDesc for NodeInternal service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -452,6 +520,14 @@ var NodeInternal_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetReplica",
 			Handler:    _NodeInternal_GetReplica_Handler,
+		},
+		{
+			MethodName: "AddNode",
+			Handler:    _NodeInternal_AddNode_Handler,
+		},
+		{
+			MethodName: "GetReplicationMetrics",
+			Handler:    _NodeInternal_GetReplicationMetrics_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

@@ -1,413 +1,180 @@
+# Distributed Key-Value Store
 
-### Server
+This project implements a distributed key-value store written in Go, designed to provide a fault-tolerant, scalable, and consistent storage system. It leverages gRPC for communication between nodes, consistent hashing for key distribution across the cluster, and replication to ensure data durability and availability. A Hybrid Logical Clock (HLC) is used to timestamp operations, enabling a total ordering of events across the distributed system.
 
-The server struct is the central component that implements:
+The system is built to handle node failures, perform read repairs, and rebalance data when the cluster topology changes, making it suitable for distributed environments where reliability and consistency are critical.
 
-- gRPC interfaces for client operations (`KVStoreServer`)
-- Internal node-to-node communication (`NodeInternalServer`)
-- Consistent hashing ring management
-- Peer management and heartbeat monitoring
-- Data replication and rebalancing logic
+## Features
+
+- **Distributed Key-Value Storage**: Keys are distributed across nodes using consistent hashing for load balancing.
+- **Replication**: Each key is replicated to multiple nodes (configurable via replication factor) for fault tolerance.
+- **Eventual Consistency with Quorum Writes**: Writes require a quorum of replicas to succeed, ensuring strong write consistency, while reads provide eventual consistency with read repair.
+- **Hybrid Logical Clock (HLC)**: Combines physical time and logical counters to order operations across nodes.
+- **Read Repair**: Automatically resolves inconsistencies during read operations by repairing stale or missing replicas.
+- **Rebalancing**: Redistributes data when nodes are added or removed, optimizing for minimal data movement.
+- **Fault Tolerance**: Detects node failures via heartbeats and attempts to reconnect to disconnected peers.
+- **Peer Gossip**: Nodes share information about new peers to maintain a fully connected mesh.
+- **Validation**: Enforces constraints on key and value sizes and allowed characters.
+
+## Architecture
+
+The system is composed of several key components that work together to provide a robust distributed key-value store:
+
+### Key Components
+
+- **Server**: Each node runs an instance of the server struct, which manages local storage, peer connections, and gRPC services.
+- **Consistent Hashing Ring**: Implemented via `consistenthash.Ring`, it maps keys to nodes and ensures even distribution and minimal data movement during cluster changes.
+- **Hybrid Logical Clock (HLC)**: Provides globally unique timestamps by combining physical time (milliseconds) with a logical counter, ensuring a total ordering of operations.
+- **Local Storage**: Managed by the `storage.Storage` package, it stores key-value pairs locally on each node with timestamps.
+- **gRPC Services**:
+  - **KVStore Service**: Exposes Get and Put methods for client interactions.
+  - **NodeInternal Service**: Handles node-to-node communication for replication, heartbeats, and peer management.
+- **Peer Management**: Nodes maintain a list of peers, establish gRPC connections, and use gossip to propagate cluster membership changes.
+- **Replication**: Ensures data redundancy by replicating writes to a configurable number of nodes, requiring a quorum for write success.
+- **Rebalancing**: Adjusts key distribution when the cluster topology changes, replicating only missing or outdated keys.
+
+### How It Works
+
+- **Key Distribution**: When a key is written or read, the consistent hashing ring determines which nodes (replicas) are responsible for it based on the replication factor.
+- **Writes**: A Put operation generates an HLC timestamp, stores the value locally, and replicates it to other designated replicas. The write succeeds only if a quorum of replicas acknowledges it.
+- **Reads**: A Get operation checks the local store if the node is a replica. If not, or if the key is missing/stale, it queries all replicas, returns the most recent value, and repairs inconsistencies asynchronously.
+- **Cluster Management**: Nodes use heartbeats to detect failures and gossip to share information about new or reconnected peers.
+- **Rebalancing**: When nodes join or leave, the system rebalances by replicating keys to new replicas or removing them from nodes no longer responsible.
+
+## Installation
+
+### Prerequisites
+
+- **Go**: Version 1.16 or higher.
+- **Protocol Buffers Compiler (protoc)**: Required to generate gRPC code from .proto files.
+- **Dependencies**: The code relies on external packages (`google.golang.org/grpc`, `github.com/google/uuid`, and custom packages `consistenthash` and `storage`).
+
+### Steps
+
+1. **Clone the Repository**:
+   ```bash
+   git clone https://github.com/your-repo/distributed-kv-store.git
+   cd distributed-kv-store
+   ```
+
+2. **Install Dependencies**:
+   Ensure the required Go modules are installed:
+   ```bash
+   go mod tidy
+   ```
+
+3. **Generate gRPC Code**:
+   Assuming a kvstore.proto file exists in kvstore/proto/:
+   ```bash
+   protoc --go_out=. --go-grpc_out=. kvstore/proto/kvstore.proto
+   ```
+
+4. **Build the Server**:
+   ```bash
+   go build -o kvstore-server server/main.go
+   ```
+
+## Usage
+
+### Running a Node
+
+Each node in the cluster runs an instance of the server. Start a node with:
+
+```bash
+./kvstore-server -id <node-id> -addr <listen-address> -peers <peer-list>
+```
+
+### Command-Line Flags
+
+- **-id**: Unique node identifier (optional; defaults to a generated UUID prefixed with `node-`).
+- **-addr**: Address to listen on (e.g., `:50051`).
+- **-peers**: Comma-separated list of peer nodes in `id@address` format (e.g., `node-1@127.0.0.1:50052,node-2@127.0.0.1:50053`).
+- **-sync-interval**: Interval for anti-entropy synchronization (default: `5m`).
+- **-heartbeat-interval**: Interval for heartbeat checks (default: `1s`).
+- **-replication-factor**: Number of replicas per key (default: `3`).
+- **-virtual-nodes**: Number of virtual nodes per physical node in the consistent hashing ring (default: `10`).
+
+### Example: Starting a Three-Node Cluster
+
+Run these commands in separate terminals:
+
+```bash
+# Node 1
+./kvstore-server -id node-1 -addr :50051 -peers node-2@127.0.0.1:50052,node-3@127.0.0.1:50053
+
+# Node 2
+./kvstore-server -id node-2 -addr :50052 -peers node-1@127.0.0.1:50051,node-3@127.0.0.1:50053
+
+# Node 3
+./kvstore-server -id node-3 -addr :50053 -peers node-1@127.0.0.1:50051,node-2@127.0.0.1:50052
+```
+
+### Interacting with the Store
+
+Clients interact with the system via the KVStore gRPC service (Get and Put methods). You can connect to any node's address (e.g., `127.0.0.1:50051`) using a gRPC client. The node handles routing requests to the appropriate replicas.
+
+#### Example gRPC Client (Pseudo-Code)
 
 ```go
-type server struct {
-    pb.UnimplementedKVStoreServer
-    pb.UnimplementedNodeInternalServer
+// Connect to a node
+conn, err := grpc.Dial("127.0.0.1:50051", grpc.WithInsecure())
+client := pb.NewKVStoreClient(conn)
 
-    nodeID string
-    store  *node.Node
-    ring   *consistenthash.Ring
-    mu     sync.RWMutex
+// Put a key-value pair
+putResp, err := client.Put(context.Background(), &pb.PutRequest{Key: "foo", Value: "bar"})
 
-    // Node management
-    peers   map[string]string
-    clients map[string]pb.NodeInternalClient
-
-    // Configuration
-    syncInterval      time.Duration
-    heartbeatInterval time.Duration
-    replicationFactor int
-
-    stopChan chan struct{}
-
-    // Rebalancing configuration
-    rebalanceConfig RebalanceConfig
-    rebalancing     atomic.Bool
+// Get a value
+getResp, err := client.Get(context.Background(), &pb.GetRequest{Key: "foo"})
+if getResp.Exists {
+    fmt.Println("Value:", getResp.Value)
 }
 ```
 
-### Configuration Options
+## Configuration
 
-The server supports various configuration options:
+The server can be customized via command-line flags (see above). Key settings include:
 
-- `syncInterval`: Time between anti-entropy synchronization
-- `heartbeatInterval`: Frequency of peer health checks
-- `replicationFactor`: Number of nodes to replicate each key to
-- `virtualNodes`: Number of virtual nodes per physical node in the consistent hash ring
+- **Replication Factor** (`-replication-factor`): Controls how many nodes store each key. Higher values increase fault tolerance but require more resources.
+- **Virtual Nodes** (`-virtual-nodes`): Increases the granularity of key distribution in the consistent hashing ring.
+- **Heartbeat Interval** (`-heartbeat-interval`): Frequency of peer health checks.
+- **Sync Interval** (`-sync-interval`): Frequency of anti-entropy synchronization (though not fully implemented in this code).
+- **Reconnect Interval**: Hardcoded to 5 seconds; nodes attempt to reconnect to disconnected peers every 5 seconds, up to 20 attempts.
 
-Rebalancing is also configurable:
+### Validation Rules
 
-```go
-type RebalanceConfig struct {
-    BatchSize     int           // Number of keys per batch
-    BatchTimeout  time.Duration // Max time per batch
-    MaxConcurrent int           // Max concurrent transfers
-    RetryAttempts int           // Number of retry attempts
-}
-```
-
-## Data Flow
-
-### Key-Value Operations
-
-#### Get Operation
-
-1. When a client calls `Get(key)`:
-   - The server retrieves the value, timestamp, and existence status from the local store
-   - Returns this information to the client
-
-```go
-func (s *server) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, error) {
-    value, timestamp, exists := s.store.Get(req.Key)
-    return &pb.GetResponse{
-        Value:     value,
-        Timestamp: timestamp,
-        Exists:    exists,
-    }, nil
-}
-```
-
-#### Put Operation
-
-1. When a client calls `Put(key, value)`:
-   - The server validates the key and value
-   - Stores the key-value pair locally with a timestamp
-   - Determines which nodes should replicate this data based on the consistent hash ring
-   - Sends replication requests to those nodes
-   - Returns the old value (if any) to the client
-
-```go
-func (s *server) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
-    if err := validateKeyValue(req.Key, req.Value); err != nil {
-        return nil, err
-    }
-
-    err := s.store.Store(req.Key, req.Value, req.Timestamp)
-    if err != nil {
-        return nil, err
-    }
-
-    oldValue, _, hadOldValue := s.store.Get(req.Key)
-    return &pb.PutResponse{
-        OldValue:    string(oldValue),
-        HadOldValue: hadOldValue,
-    }, nil
-}
-```
-
-### Replication
-
-When a key-value pair needs to be replicated:
-
-1. The source node calculates which peers should store the data using the consistent hash ring
-2. Replication requests are sent to the designated nodes
-3. Receiving nodes validate they should be replicas for the key
-4. Receiving nodes store the data if they don't have it or have an older version
-5. Acknowledgments are sent back to the source node
-
-```go
-func (s *server) replicateToNodes(key, value string, timestamp uint64) {
-    s.mu.RLock()
-    defer s.mu.RUnlock()
-
-    // Get replica nodes from ring
-    hash := s.ring.HashKey(key)
-    replicasSent := 1 // Count self as first replica
-    currentHash := hash
-
-    req := &pb.ReplicateRequest{
-        Key:       key,
-        Value:     value,
-        Timestamp: timestamp,
-    }
-
-    // Send to next nodes in ring until we hit replicationFactor
-    for replicasSent < s.replicationFactor {
-        nextNodeID := s.ring.GetNextNode(currentHash)
-        if nextNodeID == "" || nextNodeID == fmt.Sprintf("node-%s", s.nodeID) {
-            break // No more nodes available or wrapped around to self
-        }
-
-        // Extract UUID from node ID format "node-{uuid}"
-        peerID := strings.TrimPrefix(nextNodeID, "node-")
-        if client, ok := s.clients[peerID]; ok {
-            go func(c pb.NodeInternalClient, nodeID string) {
-                ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-                defer cancel()
-
-                resp, err := c.Replicate(ctx, req)
-                if err != nil {
-                    log.Printf("Failed to replicate to node %s: %v", nodeID, err)
-                } else if !resp.Success {
-                    log.Printf("Replication rejected by node %s: %s", nodeID, resp.Error)
-                }
-            }(client, nextNodeID)
-            replicasSent++
-        }
-
-        currentHash = s.ring.HashKey(nextNodeID)
-    }
-}
-```
-
-### Node Management
-
-#### Adding a Peer
-
-When a peer is added:
-
-1. The server validates the peer's UUID
-2. Adds the peer to its peer list and consistent hash ring
-3. Establishes a gRPC connection to the peer
-4. Triggers rebalancing to ensure proper data distribution
-
-```go
-func (s *server) addPeer(peerID string, addr string) error {
-    // Validate peer UUID
-    if _, err := uuid.Parse(peerID); err != nil {
-        return fmt.Errorf("invalid peer UUID: %v", err)
-    }
-
-    s.mu.Lock()
-    defer s.mu.Unlock()
-
-    // Add to peer list and ring
-    s.peers[peerID] = addr
-    s.ring.AddNode(fmt.Sprintf("node-%s", peerID))
-
-    // Establish gRPC connection
-    conn, err := grpc.Dial(addr, grpc.WithInsecure())
-    if err != nil {
-        return err
-    }
-
-    s.clients[peerID] = pb.NewNodeInternalClient(conn)
-
-    // Trigger ring rebalancing
-    s.rebalanceRing()
-
-    return nil
-}
-```
-
-#### Heartbeat Mechanism
-
-Nodes maintain health checks through a heartbeat mechanism:
-
-1. Each node periodically checks its peers
-2. If a peer fails to respond, it's considered down
-3. Failed peers are removed from the ring
-4. Data is rebalanced to ensure proper replication
-
-```go
-func (s *server) startHeartbeat() {
-    ticker := time.NewTicker(s.heartbeatInterval)
-    go func() {
-        for {
-            select {
-            case <-ticker.C:
-                s.checkPeers()
-            case <-s.stopChan:
-                ticker.Stop()
-                return
-            }
-        }
-    }()
-}
-
-func (s *server) checkPeers() {
-    s.mu.RLock()
-    peers := make(map[string]pb.NodeInternalClient)
-    for id, client := range s.clients {
-        peers[id] = client
-    }
-    s.mu.RUnlock()
-
-    for peerID, client := range peers {
-        ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-        _, err := client.Heartbeat(ctx, &pb.Ping{
-            NodeId:    uint32(consistenthash.HashString(s.nodeID)),
-            Timestamp: uint64(time.Now().UnixNano()),
-        })
-        cancel()
-
-        if err != nil {
-            s.handlePeerFailure(peerID)
-        }
-    }
-}
-```
-
-### Rebalancing
-
-When the topology changes (nodes join/leave), data must be rebalanced:
-
-1. The rebalancing process runs in batches to limit resource usage
-2. Keys are sorted and processed in chunks
-3. Concurrent batch processing is limited by a semaphore
-4. For each key, the system:
-   - Determines the new owner node
-   - Replicates the key-value pair to the new owner
-   - Includes retry logic for fault tolerance
-
-```go
-func (s *server) rebalanceRing() {
-    if !s.rebalancing.CompareAndSwap(false, true) {
-        log.Println("Rebalancing already in progress, skipping")
-        return
-    }
-    defer s.rebalancing.Store(false)
-
-    s.mu.RLock()
-    keys := s.store.GetKeys()
-    s.mu.RUnlock()
-
-    // Sort keys for deterministic batching
-    sort.Strings(keys)
-
-    // Create batches
-    var batches [][]string
-    for i := 0; i < len(keys); i += s.rebalanceConfig.BatchSize {
-        end := i + s.rebalanceConfig.BatchSize
-        if end > len(keys) {
-            end = len(keys)
-        }
-        batches = append(batches, keys[i:end])
-    }
-
-    // Process batches with concurrency control
-    sem := make(chan struct{}, s.rebalanceConfig.MaxConcurrent)
-    var wg sync.WaitGroup
-    errors := make(chan error, len(batches))
-
-    for _, batch := range batches {
-        wg.Add(1)
-        sem <- struct{}{} // Acquire semaphore
-
-        go func(batchKeys []string) {
-            defer func() {
-                <-sem // Release semaphore
-                wg.Done()
-            }()
-
-            if err := s.processBatch(batchKeys); err != nil {
-                errors <- fmt.Errorf("batch processing failed: %v", err)
-            }
-        }(batch)
-    }
-
-    // Wait for all batches to complete
-    go func() {
-        wg.Wait()
-        close(errors)
-    }()
-
-    // Collect and log errors
-    var errs []error
-    for err := range errors {
-        errs = append(errs, err)
-        log.Printf("Rebalancing error: %v", err)
-    }
-
-    if len(errs) > 0 {
-        log.Printf("Rebalancing completed with %d errors", len(errs))
-    } else {
-        log.Println("Rebalancing completed successfully")
-    }
-}
-```
-
-## Validation and Safety
-
-The system implements validation for keys and values:
-
-- Keys must follow specific character constraints
-- Keys and values have maximum size limits
-- Timestamps are used to resolve conflicts (last-write-wins)
-
-```go
-func isValidKey(key string) bool {
-    for _, r := range key {
-        if !unicode.IsLetter(r) && !unicode.IsNumber(r) &&
-            r != '-' && r != '_' && r != '.' && r != '/' {
-            return false
-        }
-    }
-    return true
-}
-
-func validateKeyValue(key, value string) error {
-    // Validate key
-    if len(key) == 0 {
-        return status.Error(codes.InvalidArgument, "key cannot be empty")
-    }
-    if len(key) > maxKeyLength {
-        return status.Errorf(codes.InvalidArgument, "key length exceeds maximum of %d bytes", maxKeyLength)
-    }
-    if !isValidKey(key) {
-        return status.Error(codes.InvalidArgument, "key contains invalid characters")
-    }
-
-    // Validate value
-    if len(value) > maxValueLength {
-        return status.Errorf(codes.InvalidArgument, "value length exceeds maximum of %d bytes", maxValueLength)
-    }
-
-    return nil
-}
-```
-
-## Server Startup and Configuration
-
-The main function handles:
-
-1. Parsing command-line flags for configuration
-2. Creating a new server instance
-3. Adding peers from the provided peer list
-4. Setting up the gRPC server
-5. Handling graceful shutdown on signal
-
-```go
-func main() {
-    nodeID := flag.String("id", "", "Node ID (optional, must be valid UUID if provided)")
-    addr := flag.String("addr", ":50051", "Address to listen on")
-    peerList := flag.String("peers", "", "Comma-separated list of peer addresses in format 'uuid@address'")
-    syncInterval := flag.Duration("sync-interval", 5*time.Minute, "Anti-entropy sync interval")
-    heartbeatInterval := flag.Duration("heartbeat-interval", time.Second, "Heartbeat check interval")
-    replicationFactor := flag.Int("replication-factor", 3, "Number of replicas per key")
-    virtualNodes := flag.Int("virtual-nodes", consistenthash.DefaultVirtualNodes, "Number of virtual nodes per physical node")
-    flag.Parse()
-
-    // ... (server creation, peer setup, and server start)
-}
-```
+- **Keys**: Must be non-empty, ≤ 256 bytes, and contain only letters, numbers, -, _, ., or /.
+- **Values**: Must be ≤ 1MB (1,024,000 bytes).
 
 ## Fault Tolerance
 
-The system provides fault tolerance through multiple mechanisms:
+The system is designed to handle node failures gracefully:
 
-1. Data replication across multiple nodes
-2. Periodic heartbeat checks to detect node failures
-3. Automatic rebalancing when topology changes
-4. Retry logic for replication operations
-5. Conflict resolution using timestamps (last-write-wins)
+- **Heartbeats**: Nodes send periodic heartbeats to detect peer failures. Failed peers are marked as disconnected, and reconnection attempts are made every 5 seconds (up to 20 attempts).
+- **Reconnection**: If a peer reconnects, it is re-added to the cluster and gossiped to other nodes.
+- **Quorum Writes**: Writes succeed only if a majority of replicas (`replicationFactor / 2) + 1` acknowledge, adjusting dynamically if fewer replicas are available.
+- **Read Repair**: Fixes missing or stale data during reads, ensuring eventual consistency.
 
-## Concurrency Control
+## Consistency Model
 
-The system uses several mechanisms for safe concurrent operation:
+- **Writes**: Provide strong consistency via quorum-based replication. A write is successful only if a majority of replicas store it.
+- **Reads**: Offer eventual consistency. If a node has an outdated or missing key, it queries all replicas, returns the latest value, and repairs inconsistencies in the background.
 
-1. Read-write mutex for access to shared state
-2. Atomic boolean for rebalancing status
-3. Semaphore for controlling concurrent batch processing
-4. Wait groups for synchronizing concurrent operations
-5. Context with timeouts for safe RPC calls
+## Rebalancing
+
+When nodes join or leave:
+
+- The consistent hashing ring updates, and the `rebalanceOnlyMissingReplicas` function runs.
+- Only keys missing from their designated replicas or with outdated timestamps are replicated, minimizing data movement.
+- Rebalancing occurs in batches (100 keys by default) with up to 5 concurrent transfers, retrying failed attempts up to 3 times.
+
+## Logging and Monitoring
+
+The server logs critical events (e.g., peer connections, replication status, rebalancing) using Go's log package. Monitor these logs to track system health and debug issues.
+
+Example log output:
+
+```
+2023/10/10 12:00:00 Node node-1 listening on :50051
+2023/10/10 12:00:01 Successfully connected to peer node-2
+2023/10/10 12:00:02 Replicated key foo to node node-3
+```.

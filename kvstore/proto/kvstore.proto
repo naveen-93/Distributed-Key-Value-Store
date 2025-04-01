@@ -1,0 +1,132 @@
+syntax = "proto3";
+
+package kvstore;
+
+option go_package = "Distributed-Key-Value-Store/kvstore/proto";
+
+// KVStore service provides the public API for the key-value store
+service KVStore {
+  // Get retrieves a value for a key
+  rpc Get(GetRequest) returns (GetResponse);
+  
+  // Put stores a value for a key
+  rpc Put(PutRequest) returns (PutResponse);
+}
+
+// NodeInternal service provides internal node-to-node communication
+service NodeInternal {
+  // Replicate replicates a key-value pair to another node
+  rpc Replicate(ReplicateRequest) returns (ReplicateResponse);
+  
+  // Heartbeat checks if a node is alive
+  rpc Heartbeat(Ping) returns (Pong);
+  
+  // AddNode adds a new node to the cluster
+  rpc AddNode(AddNodeRequest) returns (Empty);
+  
+  // GetRingState returns the current state of the consistent hash ring
+  rpc GetRingState(RingStateRequest) returns (RingStateResponse);
+  
+  // GetReplicationMetrics returns metrics about replication operations
+  rpc GetReplicationMetrics(Empty) returns (ReplicationMetricsResponse);
+  
+  // Anti-Entropy related RPCs
+  rpc GetMerkleTree(MerkleTreeRequest) returns (MerkleTreeResponse);
+  rpc GetBucketKeys(BucketKeysRequest) returns (BucketKeysResponse);
+}
+
+// GetRequest is the request for Get RPC
+message GetRequest {
+  string key = 1;
+}
+
+// GetResponse is the response for Get RPC
+message GetResponse {
+  string value = 1;
+  uint64 timestamp = 2;
+  bool exists = 3;
+}
+
+// PutRequest is the request for Put RPC
+message PutRequest {
+  string key = 1;
+  string value = 2;
+}
+
+// PutResponse is the response for Put RPC
+message PutResponse {
+  string old_value = 1;
+  bool had_old_value = 2;
+}
+
+// ReplicateRequest is the request for Replicate RPC
+message ReplicateRequest {
+  string key = 1;
+  string value = 2;
+  uint64 timestamp = 3;
+}
+
+// ReplicateResponse is the response for Replicate RPC
+message ReplicateResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+// Ping is used for heartbeat requests
+message Ping {
+  uint32 node_id = 1;
+  uint64 timestamp = 2;
+}
+
+// Pong is the response for heartbeat requests
+message Pong {
+  uint32 node_id = 1;
+  uint64 timestamp = 2;
+}
+
+// AddNodeRequest is used to add a new node to the cluster
+message AddNodeRequest {
+  string node_id = 1;
+  string addr = 2;
+}
+
+// Empty is an empty message
+message Empty {}
+
+// RingStateRequest is the request for GetRingState RPC
+message RingStateRequest {}
+
+// RingStateResponse is the response for GetRingState RPC
+message RingStateResponse {
+  uint64 version = 1;
+  map<string, bool> nodes = 2;
+  int64 updated_at = 3;
+}
+
+// ReplicationMetricsResponse contains metrics about replication operations
+message ReplicationMetricsResponse {
+  int64 total_replications = 1;
+  int64 successful_replications = 2;
+  int64 failed_replications = 3;
+  int64 pending_replications = 4;
+  int64 avg_replication_time_ms = 5;
+  int64 queue_size = 6;
+}
+
+// MerkleTreeRequest is the request for GetMerkleTree RPC
+message MerkleTreeRequest {}
+
+// MerkleTreeResponse is the response for GetMerkleTree RPC
+message MerkleTreeResponse {
+  map<string, uint64> buckets = 1;
+}
+
+// BucketKeysRequest is the request for GetBucketKeys RPC
+message BucketKeysRequest {
+  string bucket_id = 1;
+}
+
+// BucketKeysResponse is the response for GetBucketKeys RPC
+message BucketKeysResponse {
+  repeated string keys = 1;
+} 

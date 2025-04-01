@@ -1,171 +1,220 @@
 # Distributed Key-Value Store
-A scalable, fault-tolerant distributed key-value store implementation with eventual consistency.
 
-## Overview
+A high-performance, fault-tolerant distributed key-value store using consistent hashing and quorum-based replication.
 
-This distributed key-value store is designed for high availability and reliability, featuring:
+## Features
 
-- Consistent hashing for load balancing
-- Quorum-based operations for consistency
-- Write-Ahead Logging (WAL) for durability
-- Eventual consistency with anti-entropy synchronization
-- Fault tolerance through replication
+- **Distributed Architecture**: Cluster of servers with even key distribution
+- **Consistent Hashing**: Efficient data distribution with virtual nodes
+- **Replication**: Configurable replication factor for fault tolerance
+- **Read Repair**: Automatic detection and repair of stale data
+- **Quorum-Based Writes**: Ensures data durability and consistency
+- **Hybrid Logical Clocks (HLC)**: Maintains causal consistency
+- **Durability**: Write-ahead logging and snapshot mechanism
 
-## System Architecture
+## How It Works
 
-The system consists of five main components:
+### Get Operation
 
-### Storage Layer (`storage.go`)
+1. **Client Request**: Client sends a Get request with a key
+2. **Server Handling**:
+   - Server determines if it's a designated replica
+   - If yes, retrieves local value and performs read repair
+   - If no, queries all designated replicas for most recent value
+3. **Response**: Returns the most recent value or "key not found"
 
-The storage layer manages persistent data storage on each node:
+### Put Operation
 
-- In-memory hash map for fast access
-- Write-Ahead Log (WAL) for durability
-- Periodic snapshots for recovery optimization
-- Tombstone marking for eventual consistency
-- TTL-based cleanup
-- Thread-safe operations
+1. **Client Request**: Client sends a Put request with key-value pair
+2. **Server Handling**:
+   - Generates timestamp using HLC
+   - Stores data locally
+   - Replicates to designated replicas
+   - Ensures quorum acknowledgment
+3. **Response**: Returns old value (if any) or error message
 
-### Protocol Layer (`protocol.go`)
+## Architecture
 
-Handles all communication within the system:
+### Client Layer
+- Multiple clients connect via gRPC
+- Can connect to any server in the cluster
 
-- gRPC services for client and inter-node communication
-- Write replication across nodes
-- Anti-entropy synchronization
-- Health monitoring via heartbeats
-- Eventual consistency implementation
+### Server Cluster
+- Distributed system with inter-server communication
+- Consistent Hashing Ring with virtual nodes for load balancing
 
-### Client Library (`client/main.go`)
+### Storage Layer (Per Server)
+- **In-Memory Store**: Fast read/write access
+- **Write-Ahead Log (WAL)**: Operation durability
+- **Snapshots**: WAL compaction and faster recovery
 
-Provides the application interface:
+### Starting a Cluster
+```bash
+# First server
+go run pkg/server/main.go -addr :50051 -id node1
 
-- gRPC connection management
-- Quorum-based operations
-- Consistent hash-based routing
-- Read repair functionality
-- Dynamic ring state updates
-- Robust error handling with retries
+# Second server (knows about first)
+go run pkg/server/main.go -addr :50052 -id node2 -peers "node1@localhost:50051"
 
-### Consistent Hashing (`consistent_hash.go`)
-
-Manages key distribution:
-
-- Virtual nodes for balanced distribution
-- Minimal-disruption node updates
-- Efficient binary search lookups
-- Thread-safe ring operations
-
-### Server (`server/main.go`)
-
-Core server implementation:
-
-- Ring state management
-- Key rebalancing
-- gRPC service registration
-- Clean shutdown handling
-
-## Protocol Specification
-
-### Client-Server Protocol
-
-#### KVStore Service
-
-**Methods:**
-- `Get(GetRequest) -> GetResponse`
-- `Put(PutRequest) -> PutResponse`
-
-**Message Formats:**
-
-```protobuf
-message GetRequest {
-  string key = 1;
-  uint64 client_id = 2;
-  uint64 request_id = 3;
-}
-
-message GetResponse {
-  string value = 1;
-  uint64 timestamp = 2;
-  bool exists = 3;
-}
-
-message PutRequest {
-  string key = 1;
-  string value = 2;
-  uint64 client_id = 3;
-  uint64 request_id = 4;
-}
-
-message PutResponse {
-  string old_value = 1;
-  bool had_old_value = 2;
-}
+# Third server (knows about first and second)
+go run pkg/server/main.go -addr :50053 -id node3 -peers "node1@localhost:50051,node2@localhost:50052"
 ```
 
-### Server-Server Protocol
+### Using the Client Library
+```go
+client := kvstore.NewClient([]string{"localhost:8001", "localhost:8002", "localhost:8003"})
 
-#### NodeInternal Service
+// Put operation
+err := client.Put("key1", "value1")
 
-**Methods:**
-- `Replicate(ReplicateRequest) -> ReplicateResponse`
-- `SyncKeys(SyncRequest) -> SyncResponse`
-- `Heartbeat(Ping) -> Pong`
-- `GetRingState(RingStateRequest) -> RingStateResponse`
-
-**Message Formats:**
-
-```protobuf
-message ReplicateRequest {
-  string key = 1;
-  string value = 2;
-  uint64 timestamp = 3;
-}
-
-message ReplicateResponse {
-  bool success = 1;
-  string error = 2;
-}
-
-message SyncRequest {
-  map<string, uint64> key_timestamps = 1;
-  map<string, string> key_ranges = 2;
-}
-
-message SyncResponse {
-  map<string, KeyValue> missing = 1;
-  map<string, uint64> deletions = 2;
-}
-
-message Ping {
-  uint32 node_id = 1;
-}
-
-message Pong {}
-
-message RingStateRequest {}
-
-message RingStateResponse {
-  uint64 version = 1;
-  map<string, bool> nodes = 2;
-  int64 updated_at = 3;
-}
+// Get operation
+value, err := client.Get("key1")
 ```
 
-## Consistency Model
+## Client Library Usage
 
-The system implements eventual consistency through:
+### Running the Client Library
+```bash
+# Clean up any existing processes and WAL files
+sudo kill $(sudo lsof -t -i :50051)
+rm wal*
 
-- Quorum-based operations (R + W > N)
-- Last-Write-Wins (LWW) conflict resolution
-- Read repair for stale replicas
-- Anti-entropy synchronization
+# Start the cluster (3 nodes)
+bash run.sh
 
-## Fault Tolerance
+# Build and test the client library
+cd lib
+make clean && make
+make test
+```
 
-The system handles failures through:
+## Testing
 
-- Heartbeat-based failure detection
-- WAL and snapshot-based durability
-- N-way replication
-- Automatic ring updates on node failures
+### Correctness Testing
+```bash
+# Clean up any existing processes and WAL files
+sudo kill $(sudo lsof -t -i :50051)
+rm wal*
+
+# Start the cluster (3 nodes)
+bash run.sh
+
+# Run correctness tests
+cd tests
+go test -v
+```
+
+### Performance Testing
+```bash
+From Root Folder
+# Run performance tests for 10 seconds
+go test -bench=. -benchtime=10s ./test/performance_test.go
+```
+
+### Performance Testing
+```bash
+# Run performance tests for 10 seconds
+cd internal/storage
+go test -v
+```
+
+## Configuration Options
+
+- `--port`: Server listening port
+- `--id`: Unique server identifier
+- `--join`: Address of existing server to join the cluster
+- `--replication-factor`: Number of replicas (default: 3)
+- `--snapshot-interval`: Interval between snapshots in seconds (default: 300)
+
+
+# System Performance and Testing Results
+
+## Benchmark Performance
+
+### Uniform Distribution Workloads
+| Benchmark | Ops/Sec | Latency (ms) |
+|-----------|---------|--------------|
+| Read Heavy | 6,868 | 0.1454 |
+| Write Heavy | 11,107 | 0.08985 |
+| Mixed Workload | 4,005 | 0.2493 |
+
+### Hot-Cold Distribution Workloads
+| Benchmark | Ops/Sec | Latency (ms) |
+|-----------|---------|--------------|
+| Read Heavy | 5,548 | 0.1798 |
+| Write Heavy | 11,154 | 0.08930 |
+| Mixed Workload | 3,872 | 0.2577 |
+
+### Multi-Client Workloads
+| Benchmark | Ops/Sec | Latency (ms) |
+|-----------|---------|--------------|
+| Read Heavy | 15,615 | 0.6401 |
+| Write Heavy | 30,777 | 0.3245 |
+| Mixed Workload | 27,921 | 0.3578 |
+
+### Replication Latency
+| Benchmark | Avg Latency (ms) |
+|-----------|------------------|
+| Sequential | 0.1921 |
+| Random | 0.2028 |
+
+### Large Value Performance
+| Value Size | Ops/Sec | Latency (ms) |
+|------------|---------|--------------|
+| 1 KB | N/A | 0.1013 |
+| 10 KB | N/A | 0.1653 |
+
+### Storage Test
+## Stress Test Results
+- **Total Operations**: 5,000,000
+- **Total Time**: 3.74 seconds
+- **Throughput**: 1,335,051 ops/sec
+
+### Latency Percentiles
+#### Store Operations
+- p50: 1 µs
+- p95: 20.875 µs
+- p99: 38.75 µs
+
+#### Get Operations
+- p50: 84 ns
+- p95: 1.667 µs
+- p99: 3.291 µs
+
+## Long-Running Performance Test
+| Duration | Total Ops | Ops/Sec | Avg Latency | Max Latency |
+|----------|-----------|---------|-------------|-------------|
+| 5s | 6,362,655 | 1,272,531 | 2.98 µs | 6.267 ms |
+| 10s | 12,751,760 | 1,277,821 | 2.97 µs | 11.306 ms |
+| 15s | 19,087,034 | 1,267,055 | 2.98 µs | 11.306 ms |
+| 20s | 25,490,368 | 1,280,667 | 2.97 µs | 11.306 ms |
+| 25s | 31,883,304 | 1,278,587 | 2.97 µs | 11.306 ms |
+
+## Test Coverage
+- Basic Operations ✓
+- Concurrent Operations ✓
+- Write-Ahead Log (WAL) Recovery ✓
+- Timestamp Ordering ✓
+- Tombstone Behavior ✓
+- Boundary Conditions ✓
+- WAL Corruption Handling ✓
+- TTL Cleanup ✓
+- Snapshot Management ✓
+- High Concurrency ✓
+
+## Key System Design Trade-offs
+
+### Consistency vs. Availability
+- **Quorum Writes**: Ensures strong consistency at the cost of potential write availability
+- **Eventual Consistency**: Maintains high read availability with background consistency reconciliation
+
+### Performance vs. Durability
+- **Write-Ahead Logging (WAL)**: Ensures data durability with minimal write latency
+- **In-Memory Storage**: Provides fast access with periodic disk snapshots
+
+## External Libraries
+- gRPC
+- Protocol Buffers
+- Murmur3 Hash Function
+- UUID
+- Consistent Hashing Library
